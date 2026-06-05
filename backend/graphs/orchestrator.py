@@ -31,6 +31,7 @@ from backend.agents.account_operation import run_account_agent
 from backend.agents.fraud_report import run_fraud_agent
 from backend.agents.bill_payment import run_bill_agent
 from backend.agents.topup import run_topup_agent
+from backend.agents.finance_advisor import run_finance_agent
 from backend.agents.qa import run_qa_agent
 from backend.agents.data_query import run_data_query_agent
 from backend.services.guardrails import check_transaction_guardrails, validate_otp
@@ -182,6 +183,26 @@ async def data_query_agent_node(state: ChatState) -> dict:
 
     history = _messages_to_history(messages[:-1])
     result = await run_data_query_agent(
+        message=last_message,
+        user_id=state["user_id"],
+        session_id=state["session_id"],
+        history=history,
+    )
+
+    return {
+        "response_status": result["status"],
+        "response_message": result["message"],
+        "response_data": result.get("data", {}),
+    }
+
+
+async def finance_agent_node(state: ChatState) -> dict:
+    """Run finance advisor agent."""
+    messages = state["messages"]
+    last_message = messages[-1].content if messages else ""
+
+    history = _messages_to_history(messages[:-1])
+    result = await run_finance_agent(
         message=last_message,
         user_id=state["user_id"],
         session_id=state["session_id"],
@@ -439,7 +460,7 @@ def route_by_intent(state: ChatState) -> str:
         "FRAUD_REPORT": "fraud_agent",
         "DATA_QUERY": "data_query_agent",
         "QA": "qa_agent",
-        "FINANCE_ADVICE": "data_query_agent",
+        "FINANCE_ADVICE": "finance_agent",
     }
     return routing.get(intent, "qa_agent")
 
@@ -493,6 +514,7 @@ def build_orchestrator_graph() -> StateGraph:
     graph.add_node("fraud_agent", fraud_agent_node)
     graph.add_node("qa_agent", qa_agent_node)
     graph.add_node("data_query_agent", data_query_agent_node)
+    graph.add_node("finance_agent", finance_agent_node)
     graph.add_node("guardrails", guardrails_node)
     graph.add_node("confirmation", confirmation_node)
     graph.add_node("otp", otp_node)
@@ -524,6 +546,7 @@ def build_orchestrator_graph() -> StateGraph:
             "fraud_agent": "fraud_agent",
             "qa_agent": "qa_agent",
             "data_query_agent": "data_query_agent",
+            "finance_agent": "finance_agent",
         },
     )
 
@@ -536,6 +559,7 @@ def build_orchestrator_graph() -> StateGraph:
     graph.add_edge("fraud_agent", END)
     graph.add_edge("qa_agent", END)
     graph.add_edge("data_query_agent", END)
+    graph.add_edge("finance_agent", END)
 
     # Guardrails → END (sets FSM state for next invocation)
     graph.add_edge("guardrails", END)
