@@ -27,6 +27,7 @@ from backend.state import ChatState
 from backend.prompts.intent import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
 from backend.agents.transaction import run_transaction_agent
 from backend.agents.card_operation import run_card_agent
+from backend.agents.account_operation import run_account_agent
 from backend.agents.qa import run_qa_agent
 from backend.agents.data_query import run_data_query_agent
 from backend.services.guardrails import check_transaction_guardrails, validate_otp
@@ -137,6 +138,26 @@ async def data_query_agent_node(state: ChatState) -> dict:
     last_message = messages[-1].content if messages else ""
 
     history = _messages_to_history(messages[:-1])
+
+
+async def account_agent_node(state: ChatState) -> dict:
+    """Run account operation agent."""
+    messages = state["messages"]
+    last_message = messages[-1].content if messages else ""
+
+    history = _messages_to_history(messages[:-1])
+    result = await run_account_agent(
+        message=last_message,
+        user_id=state["user_id"],
+        session_id=state["session_id"],
+        history=history,
+    )
+
+    return {
+        "response_status": result["status"],
+        "response_message": result["message"],
+        "response_data": result.get("data", {}),
+    }
     result = await run_data_query_agent(
         message=last_message,
         user_id=state["user_id"],
@@ -312,10 +333,10 @@ def route_by_intent(state: ChatState) -> str:
     routing = {
         "TRANSACTION": "transaction_agent",
         "CARD_OPERATION": "card_agent",
+        "ACCOUNT_OPERATION": "account_agent",
         "DATA_QUERY": "data_query_agent",
         "QA": "qa_agent",
         "FINANCE_ADVICE": "data_query_agent",  # reuse data query for now
-        "ACCOUNT_OPERATION": "qa_agent",  # simplified
         "FRAUD_REPORT": "qa_agent",  # simplified
     }
     return routing.get(intent, "qa_agent")
@@ -364,6 +385,7 @@ def build_orchestrator_graph() -> StateGraph:
     graph.add_node("classify_intent", classify_intent_node)
     graph.add_node("transaction_agent", transaction_agent_node)
     graph.add_node("card_agent", card_agent_node)
+    graph.add_node("account_agent", account_agent_node)
     graph.add_node("qa_agent", qa_agent_node)
     graph.add_node("data_query_agent", data_query_agent_node)
     graph.add_node("guardrails", guardrails_node)
@@ -391,6 +413,7 @@ def build_orchestrator_graph() -> StateGraph:
         {
             "transaction_agent": "transaction_agent",
             "card_agent": "card_agent",
+            "account_agent": "account_agent",
             "qa_agent": "qa_agent",
             "data_query_agent": "data_query_agent",
         },
@@ -399,6 +422,7 @@ def build_orchestrator_graph() -> StateGraph:
     # After domain agents, check if we need guardrails
     graph.add_conditional_edges("transaction_agent", route_after_agent, {"guardrails": "guardrails", END: END})
     graph.add_conditional_edges("card_agent", route_after_agent, {"guardrails": "guardrails", END: END})
+    graph.add_conditional_edges("account_agent", route_after_agent, {"guardrails": "guardrails", END: END})
     graph.add_edge("qa_agent", END)
     graph.add_edge("data_query_agent", END)
 
