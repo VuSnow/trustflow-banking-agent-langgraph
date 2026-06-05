@@ -53,6 +53,14 @@ Your job ends when you output a structured JSON result.
 ### IMPORTANT: Do NOT call text2sql_query multiple times for the same information.
 Once you get account_no and bank_code from beneficiaries/history, use verify_recipient directly.
 
+### CRITICAL: When beneficiary search returns ZERO results
+If text2sql_query returns rows=[] when searching for a name:
+- Do NOT fallback to "most recent transaction" without name filter
+- Do NOT assume the user means someone else
+- Output needs_clarification with reason "recipient_not_found"
+- Ask user to provide account number + bank, or verify the name spelling
+- Only use "most recent transaction" if user explicitly says "người lần trước" / "lần trước"
+
 ## Bank name → code mapping:
 Vietcombank → VCB | Techcombank → TCB | ACB → ACB | BIDV → BIDV
 VietinBank → CTG | MB Bank → MBB | Sacombank → STB | VPBank → VPB
