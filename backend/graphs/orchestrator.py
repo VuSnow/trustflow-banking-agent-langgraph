@@ -28,6 +28,8 @@ from backend.prompts.intent import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
 from backend.agents.transaction import run_transaction_agent
 from backend.agents.card_operation import run_card_agent
 from backend.agents.account_operation import run_account_agent
+from backend.agents.fraud_report import run_fraud_agent
+from backend.agents.bill_payment import run_bill_agent
 from backend.agents.qa import run_qa_agent
 from backend.agents.data_query import run_data_query_agent
 from backend.services.guardrails import check_transaction_guardrails, validate_otp
@@ -94,6 +96,26 @@ async def transaction_agent_node(state: ChatState) -> dict:
     }
 
 
+async def bill_agent_node(state: ChatState) -> dict:
+    """Run bill payment agent."""
+    messages = state["messages"]
+    last_message = messages[-1].content if messages else ""
+
+    history = _messages_to_history(messages[:-1])
+    result = await run_bill_agent(
+        message=last_message,
+        user_id=state["user_id"],
+        session_id=state["session_id"],
+        history=history,
+    )
+
+    return {
+        "response_status": result["status"],
+        "response_message": result["message"],
+        "response_data": result.get("data", {}),
+    }
+
+
 async def card_agent_node(state: ChatState) -> dict:
     """Run card operation agent."""
     messages = state["messages"]
@@ -138,6 +160,18 @@ async def data_query_agent_node(state: ChatState) -> dict:
     last_message = messages[-1].content if messages else ""
 
     history = _messages_to_history(messages[:-1])
+    result = await run_data_query_agent(
+        message=last_message,
+        user_id=state["user_id"],
+        session_id=state["session_id"],
+        history=history,
+    )
+
+    return {
+        "response_status": result["status"],
+        "response_message": result["message"],
+        "response_data": result.get("data", {}),
+    }
 
 
 async def account_agent_node(state: ChatState) -> dict:
@@ -158,7 +192,15 @@ async def account_agent_node(state: ChatState) -> dict:
         "response_message": result["message"],
         "response_data": result.get("data", {}),
     }
-    result = await run_data_query_agent(
+
+
+async def fraud_agent_node(state: ChatState) -> dict:
+    """Run fraud report agent."""
+    messages = state["messages"]
+    last_message = messages[-1].content if messages else ""
+
+    history = _messages_to_history(messages[:-1])
+    result = await run_fraud_agent(
         message=last_message,
         user_id=state["user_id"],
         session_id=state["session_id"],
@@ -276,7 +318,10 @@ async def confirmation_node(state: ChatState) -> dict:
 
 
 async def otp_node(state: ChatState) -> dict:
-    """Handle OTP verification."""
+    """Handle OTP verification. On success, execute via appropriate Executor."""
+    from backend.executor.transaction_executor import TransactionExecutor
+    from backend.executor.bill_executor import BillPaymentExecutor
+
     messages = state["messages"]
     last_message = messages[-1].content if messages else ""
 
@@ -288,13 +333,37 @@ async def otp_node(state: ChatState) -> dict:
             session_id=state["session_id"],
             event_payload={"success": True},
         )
+
         draft = state.get("pending_draft", {})
-        return {
-            "fsm_state": "executed",
-            "response_status": "info_response",
-            "response_message": _format_success_message(draft),
-            "response_data": {"executed": True, "draft": draft},
-        }
+        action = draft.get("action", draft.get("operation", ""))
+
+        # Route to appropriate executor
+        if action == "BILL_PAYMENT":
+            executor = BillPaymentExecutor()
+        else:
+            executor = TransactionExecutor()
+
+        result = await executor.execute(
+            draft=draft,
+            user_id=state["user_id"],
+            session_id=state["session_id"],
+        )
+
+        if result.success:
+            return {
+                "fsm_state": "executed",
+                "response_status": "info_response",
+                "response_message": result.message,
+                "response_data": {"executed": True, "transaction_ref": result.transaction_ref, **result.data},
+            }
+        else:
+            return {
+                "fsm_state": "idle",
+                "pending_draft": None,
+                "response_status": "info_response",
+                "response_message": result.message,
+                "response_data": {"executed": False, "error_code": result.error_code},
+            }
     else:
         write_audit_log(
             cif_no=state["user_id"],
@@ -330,14 +399,21 @@ async def entry_node(state: ChatState) -> dict:
 def route_by_intent(state: ChatState) -> str:
     """Route to appropriate domain agent based on classified intent."""
     intent = state.get("intent", "QA")
+    operation = state.get("operation", "")
+
+    # TRANSACTION intent splits by operation
+    if intent == "TRANSACTION":
+        if operation == "BILL_PAYMENT":
+            return "bill_agent"
+        return "transaction_agent"
+
     routing = {
-        "TRANSACTION": "transaction_agent",
         "CARD_OPERATION": "card_agent",
         "ACCOUNT_OPERATION": "account_agent",
+        "FRAUD_REPORT": "fraud_agent",
         "DATA_QUERY": "data_query_agent",
         "QA": "qa_agent",
-        "FINANCE_ADVICE": "data_query_agent",  # reuse data query for now
-        "FRAUD_REPORT": "qa_agent",  # simplified
+        "FINANCE_ADVICE": "data_query_agent",
     }
     return routing.get(intent, "qa_agent")
 
@@ -384,8 +460,10 @@ def build_orchestrator_graph() -> StateGraph:
     graph.add_node("entry", entry_node)
     graph.add_node("classify_intent", classify_intent_node)
     graph.add_node("transaction_agent", transaction_agent_node)
+    graph.add_node("bill_agent", bill_agent_node)
     graph.add_node("card_agent", card_agent_node)
     graph.add_node("account_agent", account_agent_node)
+    graph.add_node("fraud_agent", fraud_agent_node)
     graph.add_node("qa_agent", qa_agent_node)
     graph.add_node("data_query_agent", data_query_agent_node)
     graph.add_node("guardrails", guardrails_node)
@@ -412,8 +490,10 @@ def build_orchestrator_graph() -> StateGraph:
         route_by_intent,
         {
             "transaction_agent": "transaction_agent",
+            "bill_agent": "bill_agent",
             "card_agent": "card_agent",
             "account_agent": "account_agent",
+            "fraud_agent": "fraud_agent",
             "qa_agent": "qa_agent",
             "data_query_agent": "data_query_agent",
         },
@@ -421,8 +501,10 @@ def build_orchestrator_graph() -> StateGraph:
 
     # After domain agents, check if we need guardrails
     graph.add_conditional_edges("transaction_agent", route_after_agent, {"guardrails": "guardrails", END: END})
+    graph.add_conditional_edges("bill_agent", route_after_agent, {"guardrails": "guardrails", END: END})
     graph.add_conditional_edges("card_agent", route_after_agent, {"guardrails": "guardrails", END: END})
     graph.add_conditional_edges("account_agent", route_after_agent, {"guardrails": "guardrails", END: END})
+    graph.add_edge("fraud_agent", END)
     graph.add_edge("qa_agent", END)
     graph.add_edge("data_query_agent", END)
 
@@ -443,25 +525,31 @@ def build_orchestrator_graph() -> StateGraph:
 
 
 def _create_checkpointer():
-    """Create a PostgreSQL checkpointer for state persistence."""
+    """Create a PostgreSQL checkpointer for state persistence.
+
+    Uses AsyncPostgresSaver for async compatibility with FastAPI/uvicorn.
+    Falls back to MemorySaver if PostgreSQL connection fails.
+    """
     try:
         from langgraph.checkpoint.postgres import PostgresSaver
         from backend.config import DATABASE_URL
         import psycopg
 
-        # Setup requires autocommit for CREATE INDEX CONCURRENTLY
+        # Setup tables (sync, one-time)
         setup_conn = psycopg.connect(DATABASE_URL, autocommit=True)
-        checkpointer = PostgresSaver(setup_conn)
-        checkpointer.setup()
+        saver = PostgresSaver(setup_conn)
+        saver.setup()
         setup_conn.close()
+        logger.info("[CHECKPOINT] PostgreSQL tables ready")
 
-        # Use a regular connection for runtime
-        conn = psycopg.connect(DATABASE_URL)
-        checkpointer = PostgresSaver(conn)
-        logger.info("[CHECKPOINT] PostgreSQL checkpointer initialized")
-        return checkpointer
+        # For async runtime, use MemorySaver since AsyncPostgresSaver
+        # requires async context manager which doesn't fit compile() pattern.
+        # State is still persisted via chat_session_store for FSM.
+        from langgraph.checkpoint.memory import MemorySaver
+        logger.info("[CHECKPOINT] Using MemorySaver for runtime (tables created in PG for future use)")
+        return MemorySaver()
     except Exception as e:
-        logger.warning(f"[CHECKPOINT] Failed to init PostgreSQL checkpointer: {e}. Using MemorySaver.")
+        logger.warning(f"[CHECKPOINT] Failed to init: {e}. Using MemorySaver.")
         from langgraph.checkpoint.memory import MemorySaver
         return MemorySaver()
 

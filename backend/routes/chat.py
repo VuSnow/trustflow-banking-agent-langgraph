@@ -64,8 +64,26 @@ async def chat_endpoint(request: ChatRequest):
         message=request.message,
     )
 
-    # Build graph input — with checkpointing, we only need to send the new message.
-    # The checkpointer restores full state (fsm_state, pending_draft, etc.) from thread_id.
+    # With checkpointing (MemorySaver), state persists between calls via thread_id.
+    # We need to check if there's an existing checkpoint to get fsm_state/pending_draft.
+    from backend.graphs.orchestrator import get_checkpointer
+    checkpointer = get_checkpointer()
+
+    existing_state = None
+    thread_config = {"configurable": {"thread_id": request.session_id}}
+    try:
+        checkpoint = checkpointer.get(thread_config)
+        if checkpoint and checkpoint.get("channel_values"):
+            existing_state = checkpoint["channel_values"]
+    except Exception:
+        pass
+
+    fsm_state = "idle"
+    pending_draft = None
+    if existing_state:
+        fsm_state = existing_state.get("fsm_state", "idle") or "idle"
+        pending_draft = existing_state.get("pending_draft")
+
     graph_input = {
         "messages": [HumanMessage(content=request.message)],
         "user_id": request.user_id,
@@ -76,8 +94,8 @@ async def chat_endpoint(request: ChatRequest):
         "response_status": "",
         "response_message": "",
         "response_data": {},
-        "fsm_state": "idle",
-        "pending_draft": None,
+        "fsm_state": fsm_state,
+        "pending_draft": pending_draft,
         "pipeline_step": 0,
         "pipeline_results": [],
     }
