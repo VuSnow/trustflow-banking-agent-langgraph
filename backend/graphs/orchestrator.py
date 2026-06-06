@@ -11,6 +11,7 @@ Design principles:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
@@ -41,10 +42,12 @@ from backend.services.flow_router import (
 )
 from backend.services.recipient_resolver import RecipientResolver, ResolutionResult, _mask_account
 from backend.services.transaction_validator import TransactionValidator
+from backend.services.bill_resolver import BillResolver
 from backend.services.otp_service import otp_service
 from backend.services.audit_log import write_audit_log
 from backend.services.langfuse_trace import get_trace_config
 from backend.agents.transaction import TransactionExtractor
+from backend.agents.bill_payment import BillPaymentExtractor
 from backend.prompts.intent import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,8 @@ logger = logging.getLogger(__name__)
 _recipient_resolver = RecipientResolver()
 _validator = TransactionValidator()
 _extractor = TransactionExtractor()
+_bill_extractor = BillPaymentExtractor()
+_bill_resolver = BillResolver()
 _flow_router = FlowRouter()
 
 
@@ -149,6 +154,44 @@ TEMPLATES = {
         "hoặc nhập \"hủy\" để hủy giao dịch."
     ),
     "ask_confirm_or_cancel": "Tôi chưa hiểu rõ. Bạn muốn xác nhận hay hủy giao dịch?",
+    # ─── Bill Payment Templates ───
+    "bill_select_biller": (
+        "Bạn có {count} tài khoản {type_name} đã đăng ký:\n\n"
+        "{biller_list}\n\n"
+        "Bạn muốn thanh toán cho tài khoản nào? (Nhập số thứ tự)"
+    ),
+    "bill_confirm_single": (
+        "Hóa đơn {type_name} cần thanh toán:\n\n"
+        "• Nhà cung cấp: {biller_name}\n"
+        "• Mã khách hàng: {customer_bill_code}\n"
+        "• Kỳ thanh toán: {bill_period}\n"
+        "• Số tiền: {amount}\n"
+        "• Hạn thanh toán: {due_date}\n\n"
+        "Bạn xác nhận thanh toán không?"
+    ),
+    "bill_confirm_multiple": (
+        "Bạn có {count} hóa đơn chưa thanh toán:\n\n"
+        "{bill_list}\n\n"
+        "Tổng cộng: {total}\n\n"
+        "Bạn muốn thanh toán tất cả không?"
+    ),
+    "bill_otp_request": (
+        "Tôi đã gửi mã OTP đến số điện thoại đăng ký của bạn.\n"
+        "Vui lòng nhập OTP để hoàn tất thanh toán.\n\n"
+        "Thanh toán: {biller_name} — {amount}."
+    ),
+    "bill_success": (
+        "Thanh toán thành công.\n\n"
+        "Mã giao dịch: {ref}\n"
+        "Thời gian: {time}\n"
+        "Nhà cung cấp: {biller_name}\n"
+        "Mã khách hàng: {customer_bill_code}\n"
+        "Kỳ: {bill_period}\n"
+        "Số tiền: {amount}\n"
+        "Số dư còn lại: {balance}"
+    ),
+    "bill_no_unpaid": "Không có hóa đơn {type_name} chưa thanh toán.",
+    "bill_no_registered": "Bạn chưa đăng ký tài khoản thanh toán hóa đơn nào. Vui lòng đăng ký tại quầy hoặc app.",
     "need_recipient": "Bạn muốn chuyển tiền cho ai? Vui lòng cho tôi biết tên người nhận hoặc số tài khoản.",
     "need_amount": "Bạn muốn chuyển bao nhiêu tiền?",
     "recipient_not_found": (
@@ -219,6 +262,45 @@ async def dispatch_agent_node(state: ChatState) -> dict:
             }
 
         if intent and intent.startswith("TRANSACTION"):
+            operation = intent.split(":")[-1] if ":" in intent else ""
+
+            if operation == "BILL_PAYMENT":
+                # Bill payment flow — use bill extractor
+                bill_result = await _bill_extractor.process(
+                    message=last_message,
+                    user_id=state["user_id"],
+                    current_bill_draft=None,
+                    session_id=state["session_id"],
+                )
+
+                new_flow = FlowState(
+                    flow_type="BILL_PAYMENT",
+                    status="COLLECTING",
+                    bill_draft=BillDraft(),
+                )
+
+                # Apply extraction to bill draft
+                if bill_result.biller_type:
+                    new_flow.bill_draft.biller_type = bill_result.biller_type
+                if bill_result.alias_hint:
+                    new_flow.bill_draft.alias = bill_result.alias_hint
+                if bill_result.biller_name_hint:
+                    new_flow.bill_draft.biller_name = bill_result.biller_name_hint
+
+                return {
+                    "active_flow": serialize_flow(new_flow),
+                    "response_data": {
+                        "agent_result": {
+                            "biller_type": bill_result.biller_type,
+                            "alias_hint": bill_result.alias_hint,
+                            "biller_name_hint": bill_result.biller_name_hint,
+                            "pay_all": bill_result.pay_all,
+                            "interpretation": bill_result.interpretation,
+                        }
+                    },
+                }
+
+            # Transaction flow (transfer money)
             # Run extractor for initial fields
             result = await _extractor.process(
                 message=last_message,
@@ -259,7 +341,11 @@ async def dispatch_agent_node(state: ChatState) -> dict:
             }
 
     elif action in ("CONTINUE_COLLECTING", "ANSWER_PENDING_QUESTION"):
-        # Run extractor with current draft context
+        # For bill payment flows, no LLM needed — orchestrator handles directly
+        if flow and flow.flow_type == "BILL_PAYMENT":
+            return {}
+
+        # Run extractor with current draft context (transaction flows)
         draft = flow.draft if flow else None
         pending_q = flow.pending_question if flow else None
 
@@ -291,6 +377,13 @@ async def dispatch_agent_node(state: ChatState) -> dict:
         }
 
     elif action == "MODIFY_DRAFT":
+        # Bill payment doesn't support modify — cancel and restart
+        if flow and flow.flow_type == "BILL_PAYMENT":
+            return {
+                "active_flow": None,
+                "response_message": "Đã hủy. Bạn muốn thanh toán hóa đơn nào?",
+            }
+
         draft = flow.draft if flow else None
         result = await _extractor.process(
             message=last_message,
@@ -353,8 +446,21 @@ async def handle_flow_action_node(state: ChatState) -> dict:
 
     # ─── CLASSIFY_NEW_INTENT / CONTINUE_COLLECTING / MODIFY_DRAFT ─────
     if action in ("CLASSIFY_NEW_INTENT", "CONTINUE_COLLECTING", "MODIFY_DRAFT", "ANSWER_PENDING_QUESTION"):
-        if not flow or not flow.draft:
-            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền trong bản demo này."}
+        if not flow:
+            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền hoặc thanh toán hóa đơn."}
+
+        # ── Bill Payment Flow ──
+        if flow.flow_type == "BILL_PAYMENT":
+            flow, message = _handle_bill_collecting(flow, user_id, response_data, action, decision_data)
+            flow.updated_at = datetime.now()
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_message": message,
+            }
+
+        # ── Transaction Flow ──
+        if not flow.draft:
+            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền hoặc thanh toán hóa đơn."}
 
         agent_result = response_data.get("agent_result", {})
         plan_data = agent_result.get("recipient_resolution_plan")
@@ -377,6 +483,48 @@ async def handle_flow_action_node(state: ChatState) -> dict:
     if action == "CONFIRM":
         if not flow:
             return {"response_message": "Không có giao dịch nào đang chờ xác nhận."}
+
+        # ── Bill: WAITING_BILL_CONFIRMATION → OTP ──
+        if flow.status == "WAITING_BILL_CONFIRMATION" and flow.flow_type == "BILL_PAYMENT":
+            bill_draft = flow.bill_draft
+            if not bill_draft or not bill_draft.bill_id:
+                return {"response_message": "Thông tin hóa đơn không đầy đủ."}
+
+            # Create OTP challenge (use bill_id as hash)
+            summary_hash = hashlib.sha256(
+                f"{bill_draft.bill_id}:{bill_draft.amount}:{bill_draft.customer_bill_code}".encode()
+            ).hexdigest()[:32]
+
+            challenge_id = otp_service.create_challenge(
+                flow_id=flow.flow_id,
+                user_id=user_id,
+                summary_hash=summary_hash,
+            )
+            flow.otp_challenge_id = challenge_id
+            flow.status = "WAITING_OTP"
+            flow.pending_question = PendingQuestion(
+                slot="otp",
+                question="Nhập mã OTP",
+                expected_type="otp",
+            )
+            flow.updated_at = datetime.now()
+
+            message = TEMPLATES["bill_otp_request"].format(
+                biller_name=bill_draft.biller_name or "?",
+                amount=f"{bill_draft.amount:,.0f} VND" if bill_draft.amount else "?",
+            )
+
+            write_audit_log(
+                cif_no=user_id,
+                event_type="BILL_OTP_CHALLENGE_CREATED",
+                actor="system",
+                session_id=session_id,
+                event_payload={"challenge_id": challenge_id, "bill_id": bill_draft.bill_id},
+            )
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_message": message,
+            }
 
         if flow.status == "WAITING_RECIPIENT_CONFIRMATION":
             flow = await _handle_recipient_confirmed(flow, user_id)
@@ -446,7 +594,15 @@ async def handle_flow_action_node(state: ChatState) -> dict:
             return {"response_message": "Không có giao dịch nào đang chờ OTP."}
 
         otp_input = decision_data.get("data", {}).get("otp", "")
-        current_hash = flow.draft.summary_hash()
+
+        # Compute summary hash based on flow type
+        if flow.flow_type == "BILL_PAYMENT" and flow.bill_draft:
+            bd = flow.bill_draft
+            current_hash = hashlib.sha256(
+                f"{bd.bill_id}:{bd.amount}:{bd.customer_bill_code}".encode()
+            ).hexdigest()[:32]
+        else:
+            current_hash = flow.draft.summary_hash()
 
         result = otp_service.validate(
             challenge_id=flow.otp_challenge_id,
@@ -455,10 +611,6 @@ async def handle_flow_action_node(state: ChatState) -> dict:
         )
 
         if result.valid:
-            # Execute transaction
-            flow.draft.idempotency_key = f"{flow.flow_id}:{flow.draft.confirmation_id}"
-            flow.status = "EXECUTING"
-
             write_audit_log(
                 cif_no=user_id,
                 event_type="OTP_VALIDATED",
@@ -467,9 +619,25 @@ async def handle_flow_action_node(state: ChatState) -> dict:
                 event_payload={"success": True},
             )
 
-            exec_result = await _execute_transaction(flow, user_id, session_id)
-            flow.status = "COMPLETED"
-            flow.updated_at = datetime.now()
+            if flow.flow_type == "BILL_PAYMENT":
+                # Execute bill payment
+                flow.status = "EXECUTING"
+                exec_result = await _execute_bill_payment(flow, user_id, session_id)
+                flow.status = "COMPLETED"
+                flow.updated_at = datetime.now()
+                return {
+                    "active_flow": None,
+                    "response_message": exec_result["message"],
+                    "response_data": exec_result.get("data", {}),
+                }
+            else:
+                # Execute transaction
+                flow.draft.idempotency_key = f"{flow.flow_id}:{flow.draft.confirmation_id}"
+                flow.status = "EXECUTING"
+
+                exec_result = await _execute_transaction(flow, user_id, session_id)
+                flow.status = "COMPLETED"
+                flow.updated_at = datetime.now()
 
             message = exec_result["message"]
             if flow.interrupted_intent:
@@ -548,9 +716,16 @@ async def handle_flow_action_node(state: ChatState) -> dict:
             )
             flow.updated_at = datetime.now()
 
+            if flow.flow_type == "BILL_PAYMENT" and flow.bill_draft:
+                amount_str = f"{flow.bill_draft.amount:,.0f} VND" if flow.bill_draft.amount else "?"
+                name_str = flow.bill_draft.biller_name or "hóa đơn"
+            else:
+                amount_str = f"{flow.draft.amount:,.0f} VND" if flow.draft and flow.draft.amount else "?"
+                name_str = flow.draft.recipient_name if flow.draft else "?"
+
             message = TEMPLATES["interrupt_locked"].format(
-                amount=f"{flow.draft.amount:,.0f} VND" if flow.draft and flow.draft.amount else "?",
-                recipient_name=flow.draft.recipient_name if flow.draft else "?",
+                amount=amount_str,
+                recipient_name=name_str,
             )
             return {
                 "active_flow": serialize_flow(flow),
@@ -564,6 +739,8 @@ async def handle_flow_action_node(state: ChatState) -> dict:
         elif flow and flow.status in (
             "WAITING_RECIPIENT_CONFIRMATION",
             "WAITING_DRAFT_CONFIRMATION",
+            "WAITING_BILL_CONFIRMATION",
+            "WAITING_TOPUP_CONFIRMATION",
         ):
             return {"response_message": TEMPLATES["ask_confirm_or_cancel"]}
         return {"response_message": "Tôi chưa hiểu rõ. Vui lòng thử lại."}
@@ -1021,6 +1198,7 @@ def _intent_display_name(intent: str) -> str:
     """Map intent code to Vietnamese display name."""
     names = {
         "TRANSACTION": "chuyển tiền",
+        "BILL_PAYMENT": "thanh toán hóa đơn",
         "FRAUD_REPORT": "báo cáo lừa đảo",
         "CARD_OPERATION": "quản lý thẻ",
         "ACCOUNT_OPERATION": "quản lý tài khoản",
@@ -1029,3 +1207,291 @@ def _intent_display_name(intent: str) -> str:
         "FINANCE_ADVICE": "tư vấn tài chính",
     }
     return names.get(intent, intent.lower())
+
+
+# ─── Bill Payment Helpers ─────────────────────────────────────────────────────
+
+
+def _handle_bill_collecting(
+    flow: FlowState,
+    user_id: str,
+    response_data: dict,
+    action: str,
+    decision_data: dict,
+) -> tuple[FlowState, str]:
+    """Handle bill payment flow in COLLECTING / WAITING_BILLER_SELECTION state.
+
+    Resolution logic:
+    1. Query BillResolver with extracted filters
+    2. If 0 billers: inform user
+    3. If 1 biller with 1 unpaid bill: show confirmation
+    4. If 1 biller with multiple bills: show list, ask confirm all
+    5. If multiple billers: ask user to select
+    """
+    bill_draft = flow.bill_draft
+    if not bill_draft:
+        bill_draft = BillDraft()
+        flow.bill_draft = bill_draft
+
+    agent_result = response_data.get("agent_result", {})
+
+    # Handle biller selection answer
+    if action == "ANSWER_PENDING_QUESTION" and flow.pending_question:
+        if flow.pending_question.slot == "biller_choice":
+            choice = decision_data.get("data", {}).get("choice")
+            if choice:
+                bill_draft.biller_code = choice.get("biller_code")
+                bill_draft.biller_name = choice.get("biller_name")
+                bill_draft.biller_type = choice.get("biller_type")
+                bill_draft.customer_bill_code = choice.get("customer_bill_code")
+                bill_draft.alias = choice.get("alias")
+                flow.pending_question = None
+
+    # Apply fresh extraction if available
+    if agent_result:
+        if agent_result.get("biller_type"):
+            bill_draft.biller_type = agent_result["biller_type"]
+        if agent_result.get("alias_hint"):
+            bill_draft.alias = agent_result["alias_hint"]
+        if agent_result.get("biller_name_hint"):
+            bill_draft.biller_name = agent_result["biller_name_hint"]
+
+    pay_all = agent_result.get("pay_all", False)
+
+    # If we already have a specific customer_bill_code (from selection), lookup bills directly
+    if bill_draft.customer_bill_code:
+        bills = _bill_resolver.lookup_unpaid_bills(
+            [bill_draft.customer_bill_code],
+            biller_code=bill_draft.biller_code,
+        )
+        if not bills:
+            type_name = _biller_type_display(bill_draft.biller_type)
+            flow.status = "COLLECTING"
+            return flow, f"Không có hóa đơn {type_name} chưa thanh toán cho mã {bill_draft.customer_bill_code}."
+
+        # Pick the first bill (most urgent by due_date)
+        bill = bills[0]
+        bill_draft.bill_id = bill.bill_id
+        bill_draft.biller_code = bill.biller_code
+        bill_draft.biller_name = bill.biller_name
+        bill_draft.biller_type = bill.biller_type
+        bill_draft.customer_bill_code = bill.customer_bill_code
+        bill_draft.bill_period = bill.bill_period
+        bill_draft.amount = bill.amount_due
+        bill_draft.due_date = bill.due_date
+
+        if len(bills) == 1:
+            flow.status = "WAITING_BILL_CONFIRMATION"
+            flow.pending_question = PendingQuestion(
+                slot="bill_confirmation",
+                question="Xác nhận thanh toán hóa đơn",
+                expected_type="enum",
+                options=[{"value": "confirm"}, {"value": "cancel"}],
+            )
+            message = TEMPLATES["bill_confirm_single"].format(
+                type_name=_biller_type_display(bill.biller_type),
+                biller_name=bill.biller_name,
+                customer_bill_code=bill.customer_bill_code,
+                bill_period=bill.bill_period,
+                amount=f"{bill.amount_due:,.0f} VND",
+                due_date=bill.due_date,
+            )
+            return flow, message
+        else:
+            # Multiple bills for same biller — sum them
+            total = sum(b.amount_due for b in bills)
+            bill_draft.amount = total
+            # Store all bill IDs in candidates for batch payment
+            bill_draft.candidates = [
+                {
+                    "bill_id": b.bill_id,
+                    "bill_period": b.bill_period,
+                    "amount_due": b.amount_due,
+                    "due_date": b.due_date,
+                }
+                for b in bills
+            ]
+            flow.status = "WAITING_BILL_CONFIRMATION"
+            flow.pending_question = PendingQuestion(
+                slot="bill_confirmation",
+                question="Xác nhận thanh toán hóa đơn",
+                expected_type="enum",
+                options=[{"value": "confirm"}, {"value": "cancel"}],
+            )
+            bill_list = "\n".join(
+                f"  {i+1}. Kỳ {b.bill_period} — {b.amount_due:,.0f} VND (hạn {b.due_date})"
+                for i, b in enumerate(bills)
+            )
+            message = TEMPLATES["bill_confirm_multiple"].format(
+                count=len(bills),
+                bill_list=bill_list,
+                total=f"{total:,.0f} VND",
+            )
+            return flow, message
+
+    # Full resolution: find billers + bills
+    resolution = _bill_resolver.resolve(
+        user_id=user_id,
+        biller_type=bill_draft.biller_type,
+        alias_hint=bill_draft.alias,
+        biller_name_hint=bill_draft.biller_name,
+        pay_all=pay_all,
+    )
+
+    if resolution.message:
+        # No billers or no unpaid bills
+        flow.status = "COLLECTING"
+        return flow, resolution.message
+
+    billers = resolution.billers
+    unpaid_bills = resolution.unpaid_bills
+
+    # Multiple billers of same type → ask user to select
+    if len(billers) > 1 and not pay_all:
+        flow.status = "COLLECTING"
+        flow.pending_question = PendingQuestion(
+            slot="biller_choice",
+            question=f"Chọn tài khoản thanh toán",
+            expected_type="recipient_choice",
+            options=[
+                {
+                    "biller_code": b.biller_code,
+                    "biller_name": b.biller_name,
+                    "biller_type": b.biller_type,
+                    "customer_bill_code": b.customer_bill_code,
+                    "alias": b.alias,
+                }
+                for b in billers
+            ],
+        )
+        type_name = _biller_type_display(bill_draft.biller_type)
+        biller_list = "\n".join(
+            f"  {i+1}. {b.biller_name} — {b.customer_bill_code}" + (f" ({b.alias})" if b.alias else "")
+            for i, b in enumerate(billers)
+        )
+        message = TEMPLATES["bill_select_biller"].format(
+            count=len(billers),
+            type_name=type_name,
+            biller_list=biller_list,
+        )
+        return flow, message
+
+    # Single biller (or pay_all) → show bill confirmation
+    if len(unpaid_bills) == 1:
+        bill = unpaid_bills[0]
+        bill_draft.bill_id = bill.bill_id
+        bill_draft.biller_code = bill.biller_code
+        bill_draft.biller_name = bill.biller_name
+        bill_draft.biller_type = bill.biller_type
+        bill_draft.customer_bill_code = bill.customer_bill_code
+        bill_draft.bill_period = bill.bill_period
+        bill_draft.amount = bill.amount_due
+        bill_draft.due_date = bill.due_date
+
+        flow.status = "WAITING_BILL_CONFIRMATION"
+        flow.pending_question = PendingQuestion(
+            slot="bill_confirmation",
+            question="Xác nhận thanh toán hóa đơn",
+            expected_type="enum",
+            options=[{"value": "confirm"}, {"value": "cancel"}],
+        )
+        message = TEMPLATES["bill_confirm_single"].format(
+            type_name=_biller_type_display(bill.biller_type),
+            biller_name=bill.biller_name,
+            customer_bill_code=bill.customer_bill_code,
+            bill_period=bill.bill_period,
+            amount=f"{bill.amount_due:,.0f} VND",
+            due_date=bill.due_date,
+        )
+        return flow, message
+    else:
+        # Multiple bills
+        # For single biller, pick first bill for primary draft
+        bill = unpaid_bills[0]
+        total = resolution.total_amount
+        bill_draft.bill_id = bill.bill_id
+        bill_draft.biller_code = bill.biller_code
+        bill_draft.biller_name = bill.biller_name
+        bill_draft.biller_type = bill.biller_type
+        bill_draft.customer_bill_code = bill.customer_bill_code
+        bill_draft.bill_period = bill.bill_period
+        bill_draft.amount = total if pay_all else bill.amount_due
+        bill_draft.due_date = bill.due_date
+        bill_draft.candidates = [
+            {
+                "bill_id": b.bill_id,
+                "biller_name": b.biller_name,
+                "bill_period": b.bill_period,
+                "amount_due": b.amount_due,
+                "due_date": b.due_date,
+            }
+            for b in unpaid_bills
+        ]
+
+        flow.status = "WAITING_BILL_CONFIRMATION"
+        flow.pending_question = PendingQuestion(
+            slot="bill_confirmation",
+            question="Xác nhận thanh toán hóa đơn",
+            expected_type="enum",
+            options=[{"value": "confirm"}, {"value": "cancel"}],
+        )
+        bill_list = "\n".join(
+            f"  {i+1}. {b.biller_name} — kỳ {b.bill_period} — {b.amount_due:,.0f} VND (hạn {b.due_date})"
+            for i, b in enumerate(unpaid_bills)
+        )
+        message = TEMPLATES["bill_confirm_multiple"].format(
+            count=len(unpaid_bills),
+            bill_list=bill_list,
+            total=f"{total:,.0f} VND",
+        )
+        return flow, message
+
+
+def _biller_type_display(biller_type: str | None) -> str:
+    """Map biller type to Vietnamese display."""
+    if not biller_type:
+        return "hóa đơn"
+    return {
+        "ELECTRICITY": "điện",
+        "WATER": "nước",
+        "INTERNET": "internet",
+        "PHONE_POSTPAID": "điện thoại trả sau",
+    }.get(biller_type, "hóa đơn")
+
+
+async def _execute_bill_payment(flow: FlowState, user_id: str, session_id: str) -> dict:
+    """Execute bill payment via BillPaymentExecutor."""
+    from backend.executor.bill_executor import BillPaymentExecutor
+
+    bill_draft = flow.bill_draft
+    executor = BillPaymentExecutor()
+
+    exec_draft = {
+        "bill_id": bill_draft.bill_id,
+        "biller_code": bill_draft.biller_code,
+        "customer_bill_code": bill_draft.customer_bill_code,
+        "amount": bill_draft.amount,
+    }
+
+    result = await executor.execute(
+        draft=exec_draft,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+    if result.success:
+        message = TEMPLATES["bill_success"].format(
+            ref=result.transaction_ref or "N/A",
+            time=datetime.now().strftime("%d/%m/%Y %H:%M"),
+            biller_name=bill_draft.biller_name or "?",
+            customer_bill_code=bill_draft.customer_bill_code or "?",
+            bill_period=bill_draft.bill_period or "?",
+            amount=f"{bill_draft.amount:,.0f} VND" if bill_draft.amount else "?",
+            balance=f"{result.balance_after:,.0f} VND" if result.balance_after else "?",
+        )
+        return {"message": message, "data": {"executed": True, "ref": result.transaction_ref}}
+    else:
+        return {
+            "message": f"Thanh toán thất bại: {result.message}",
+            "data": {"executed": False, "error": result.error_code},
+        }
