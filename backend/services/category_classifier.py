@@ -144,12 +144,23 @@ class CategoryClassifier:
                     break
             confidence = 0.5
 
-        # Build alternatives: exclude predicted, limit to 5
-        alternatives = [
+        # Build alternatives: prefer same group first, then common categories
+        same_group = [
             {"category_id": c["category_id"], "code": c["category_code"], "name": c["category_name"]}
             for c in eligible
             if c["category_code"] != predicted["category_code"]
-        ][:5]
+            and c["category_group"] == predicted["category_group"]
+        ]
+        other_common = [
+            {"category_id": c["category_id"], "code": c["category_code"], "name": c["category_name"]}
+            for c in eligible
+            if c["category_code"] != predicted["category_code"]
+            and c["category_group"] != predicted["category_group"]
+            and c["category_code"] in (
+                "FOOD", "SHOPPING", "RENT", "FAMILY_TRANSFER", "TRANSFER", "OTHER"
+            )
+        ]
+        alternatives = (same_group + other_common)[:5]
 
         return {
             "predicted_code": predicted["category_code"],

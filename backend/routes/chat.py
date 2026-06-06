@@ -136,6 +136,8 @@ async def chat_endpoint(request: ChatRequest):
             "WAITING_TOPUP_CONFIRMATION",
         ):
             auth_required = "confirm"
+        elif result_flow.status == "WAITING_CATEGORY_CONFIRMATION":
+            auth_required = "category_confirm"
         elif result_flow.status == "COLLECTING":
             status = "collecting"
     else:

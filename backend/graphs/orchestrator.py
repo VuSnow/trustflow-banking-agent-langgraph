@@ -29,6 +29,7 @@ from backend.models.flow import (
     TransactionDraft,
     BillDraft,
     TopUpDraft,
+    CategoryPrediction,
     PendingQuestion,
     InterruptedIntent,
     RecipientResolutionPlan,
@@ -48,6 +49,8 @@ from backend.services.audit_log import write_audit_log
 from backend.services.langfuse_trace import get_trace_config
 from backend.agents.transaction import TransactionExtractor
 from backend.agents.bill_payment import BillPaymentExtractor
+from backend.agents.topup import TopUpExtractor
+from backend.services.category_classifier import CategoryClassifier
 from backend.prompts.intent import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,8 @@ _validator = TransactionValidator()
 _extractor = TransactionExtractor()
 _bill_extractor = BillPaymentExtractor()
 _bill_resolver = BillResolver()
+_topup_extractor = TopUpExtractor()
+_category_classifier = CategoryClassifier()
 _flow_router = FlowRouter()
 
 
@@ -206,6 +211,41 @@ TEMPLATES = {
         "⚠️ Tài khoản này đã bị xác nhận là tài khoản lừa đảo. "
         "Giao dịch không thể thực hiện."
     ),
+    # ─── Top-Up Templates ───
+    "topup_confirm": (
+        "Xác nhận nạp tiền:\n\n"
+        "• Số điện thoại: {target}\n"
+        "• Nhà mạng: {provider}\n"
+        "• Số tiền: {amount}\n\n"
+        "Bạn xác nhận nạp tiền không?"
+    ),
+    "topup_otp_request": (
+        "Tôi đã gửi mã OTP đến số điện thoại đăng ký của bạn.\n"
+        "Vui lòng nhập OTP để hoàn tất nạp tiền.\n\n"
+        "Nạp {amount} cho {target} ({provider})."
+    ),
+    "topup_success": (
+        "Nạp tiền thành công.\n\n"
+        "Mã giao dịch: {ref}\n"
+        "Thời gian: {time}\n"
+        "Số điện thoại: {target}\n"
+        "Nhà mạng: {provider}\n"
+        "Số tiền: {amount}\n"
+        "Số dư còn lại: {balance}"
+    ),
+    "topup_need_phone": "Bạn muốn nạp tiền cho số điện thoại nào?",
+    "topup_need_amount": "Bạn muốn nạp bao nhiêu cho số {target}?",
+    "topup_invalid_phone": "Số điện thoại không hợp lệ. Vui lòng nhập số bắt đầu bằng 0 (10 chữ số).",
+    "topup_amount_invalid": "Số tiền nạp phải từ 10,000 đến {max_amount} VND.",
+    # ─── Category Templates ───
+    "category_confirm": (
+        "📂 Giao dịch này thuộc loại: **{predicted_name}**\n"
+        "Đúng không? Hoặc chọn:\n"
+        "{alternatives_list}\n"
+        "(Gõ \"bỏ qua\" nếu không muốn phân loại)"
+    ),
+    "category_confirmed": "✅ Đã phân loại: **{category_name}**",
+    "category_saved_default": "📂 Đã lưu phân loại: **{category_name}**",
 }
 
 
@@ -245,6 +285,20 @@ async def dispatch_agent_node(state: ChatState) -> dict:
     last_message = messages[-1].content if messages else ""
 
     if action == "CLASSIFY_NEW_INTENT":
+        # If user abandons category confirmation → save predicted before routing
+        _category_was_cleared = False
+        if flow and flow.status == "WAITING_CATEGORY_CONFIRMATION" and flow.category_prediction:
+            _category_classifier.update_category(
+                flow.category_prediction.transaction_ref,
+                flow.category_prediction.predicted_category_id,
+            )
+            logger.info(
+                f"[CATEGORY] Auto-saved predicted={flow.category_prediction.predicted_code} "
+                f"for ref={flow.category_prediction.transaction_ref} (user switched intent)"
+            )
+            flow = None  # clear the category flow
+            _category_was_cleared = True
+
         intent = await _classify_intent(last_message)
 
         if intent is None:
@@ -256,10 +310,13 @@ async def dispatch_agent_node(state: ChatState) -> dict:
                 user_id=state["user_id"],
                 session_id=state["session_id"],
             )
-            return {
+            result = {
                 "response_message": qa_result["message"],
                 "response_data": {"handled": True, "task_type": "QA"},
             }
+            if _category_was_cleared:
+                result["active_flow"] = None
+            return result
 
         if intent and intent.startswith("TRANSACTION"):
             operation = intent.split(":")[-1] if ":" in intent else ""
@@ -300,6 +357,44 @@ async def dispatch_agent_node(state: ChatState) -> dict:
                     },
                 }
 
+            if operation == "TOP_UP":
+                # Top-up flow — use topup extractor
+                topup_result = await _topup_extractor.process(
+                    message=last_message,
+                    user_id=state["user_id"],
+                    current_draft=None,
+                    session_id=state["session_id"],
+                )
+
+                new_flow = FlowState(
+                    flow_type="TOP_UP",
+                    status="COLLECTING",
+                    topup_draft=TopUpDraft(),
+                )
+
+                # Apply extraction to topup draft
+                if topup_result.topup_target:
+                    new_flow.topup_draft.topup_target = topup_result.topup_target
+                if topup_result.topup_provider:
+                    new_flow.topup_draft.topup_provider = topup_result.topup_provider
+                if topup_result.topup_type:
+                    new_flow.topup_draft.topup_type = topup_result.topup_type
+                if topup_result.amount:
+                    new_flow.topup_draft.amount = topup_result.amount
+
+                return {
+                    "active_flow": serialize_flow(new_flow),
+                    "response_data": {
+                        "agent_result": {
+                            "topup_target": topup_result.topup_target,
+                            "topup_provider": topup_result.topup_provider,
+                            "topup_type": topup_result.topup_type,
+                            "amount": topup_result.amount,
+                            "interpretation": topup_result.interpretation,
+                        }
+                    },
+                }
+
             # Transaction flow (transfer money)
             # Run extractor for initial fields
             result = await _extractor.process(
@@ -334,16 +429,56 @@ async def dispatch_agent_node(state: ChatState) -> dict:
                 },
             }
         else:
-            # Non-transaction intent — respond that only TRANSACTION supported in Phase 1
-            return {
-                "response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền trong bản demo này.",
+            # Non-transaction intent
+            result = {
+                "response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, và nạp tiền.",
                 "response_data": {"handled": True},
             }
+            if _category_was_cleared:
+                result["active_flow"] = None
+            return result
 
     elif action in ("CONTINUE_COLLECTING", "ANSWER_PENDING_QUESTION"):
+        # Category confirmation — no LLM needed, handle in handle_flow_action
+        if flow and flow.status == "WAITING_CATEGORY_CONFIRMATION":
+            return {}
+
         # For bill payment flows, no LLM needed — orchestrator handles directly
         if flow and flow.flow_type == "BILL_PAYMENT":
             return {}
+
+        # For top-up flows, use topup extractor
+        if flow and flow.flow_type == "TOP_UP":
+            topup_result = await _topup_extractor.process(
+                message=last_message,
+                user_id=state["user_id"],
+                current_draft=flow.topup_draft,
+                session_id=state["session_id"],
+            )
+            # Apply extraction
+            if flow.topup_draft is None:
+                flow.topup_draft = TopUpDraft()
+            if topup_result.topup_target:
+                flow.topup_draft.topup_target = topup_result.topup_target
+            if topup_result.topup_provider:
+                flow.topup_draft.topup_provider = topup_result.topup_provider
+            if topup_result.topup_type:
+                flow.topup_draft.topup_type = topup_result.topup_type
+            if topup_result.amount:
+                flow.topup_draft.amount = topup_result.amount
+
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_data": {
+                    "agent_result": {
+                        "topup_target": topup_result.topup_target,
+                        "topup_provider": topup_result.topup_provider,
+                        "topup_type": topup_result.topup_type,
+                        "amount": topup_result.amount,
+                        "interpretation": topup_result.interpretation,
+                    }
+                },
+            }
 
         # Run extractor with current draft context (transaction flows)
         draft = flow.draft if flow else None
@@ -382,6 +517,13 @@ async def dispatch_agent_node(state: ChatState) -> dict:
             return {
                 "active_flow": None,
                 "response_message": "Đã hủy. Bạn muốn thanh toán hóa đơn nào?",
+            }
+
+        # Top-up doesn't support modify — cancel and restart
+        if flow and flow.flow_type == "TOP_UP":
+            return {
+                "active_flow": None,
+                "response_message": "Đã hủy. Bạn muốn nạp tiền cho số nào?",
             }
 
         draft = flow.draft if flow else None
@@ -444,10 +586,26 @@ async def handle_flow_action_node(state: ChatState) -> dict:
     if state.get("response_message"):
         return {}
 
+    # ─── ANSWER_PENDING_QUESTION for category selection ───────────────
+    if action == "ANSWER_PENDING_QUESTION" and flow and flow.status == "WAITING_CATEGORY_CONFIRMATION":
+        category_choice = decision_data.get("data", {}).get("category_choice")
+        if category_choice and flow.category_prediction:
+            _category_classifier.update_category(
+                flow.category_prediction.transaction_ref,
+                category_choice["category_id"],
+            )
+            message = TEMPLATES["category_confirmed"].format(
+                category_name=category_choice["name"]
+            )
+            return {
+                "active_flow": None,
+                "response_message": message,
+            }
+
     # ─── CLASSIFY_NEW_INTENT / CONTINUE_COLLECTING / MODIFY_DRAFT ─────
     if action in ("CLASSIFY_NEW_INTENT", "CONTINUE_COLLECTING", "MODIFY_DRAFT", "ANSWER_PENDING_QUESTION"):
         if not flow:
-            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền hoặc thanh toán hóa đơn."}
+            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, hoặc nạp tiền."}
 
         # ── Bill Payment Flow ──
         if flow.flow_type == "BILL_PAYMENT":
@@ -458,9 +616,18 @@ async def handle_flow_action_node(state: ChatState) -> dict:
                 "response_message": message,
             }
 
+        # ── Top-Up Flow ──
+        if flow.flow_type == "TOP_UP":
+            flow, message = _handle_topup_collecting(flow, user_id, response_data)
+            flow.updated_at = datetime.now()
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_message": message,
+            }
+
         # ── Transaction Flow ──
         if not flow.draft:
-            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền hoặc thanh toán hóa đơn."}
+            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, hoặc nạp tiền."}
 
         agent_result = response_data.get("agent_result", {})
         plan_data = agent_result.get("recipient_resolution_plan")
@@ -483,6 +650,20 @@ async def handle_flow_action_node(state: ChatState) -> dict:
     if action == "CONFIRM":
         if not flow:
             return {"response_message": "Không có giao dịch nào đang chờ xác nhận."}
+
+        # ── Category: WAITING_CATEGORY_CONFIRMATION → save predicted ──
+        if flow.status == "WAITING_CATEGORY_CONFIRMATION" and flow.category_prediction:
+            prediction = flow.category_prediction
+            _category_classifier.update_category(
+                prediction.transaction_ref, prediction.predicted_category_id
+            )
+            message = TEMPLATES["category_confirmed"].format(
+                category_name=prediction.predicted_name
+            )
+            return {
+                "active_flow": None,
+                "response_message": message,
+            }
 
         # ── Bill: WAITING_BILL_CONFIRMATION → OTP ──
         if flow.status == "WAITING_BILL_CONFIRMATION" and flow.flow_type == "BILL_PAYMENT":
@@ -520,6 +701,49 @@ async def handle_flow_action_node(state: ChatState) -> dict:
                 actor="system",
                 session_id=session_id,
                 event_payload={"challenge_id": challenge_id, "bill_id": bill_draft.bill_id},
+            )
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_message": message,
+            }
+
+        # ── TopUp: WAITING_TOPUP_CONFIRMATION → OTP ──
+        if flow.status == "WAITING_TOPUP_CONFIRMATION" and flow.flow_type == "TOP_UP":
+            topup_draft = flow.topup_draft
+            if not topup_draft or not topup_draft.topup_target or not topup_draft.amount:
+                return {"response_message": "Thông tin nạp tiền không đầy đủ."}
+
+            # Create OTP challenge
+            summary_hash = hashlib.sha256(
+                f"{topup_draft.topup_target}:{topup_draft.amount}:{topup_draft.topup_provider}".encode()
+            ).hexdigest()[:32]
+
+            challenge_id = otp_service.create_challenge(
+                flow_id=flow.flow_id,
+                user_id=user_id,
+                summary_hash=summary_hash,
+            )
+            flow.otp_challenge_id = challenge_id
+            flow.status = "WAITING_OTP"
+            flow.pending_question = PendingQuestion(
+                slot="otp",
+                question="Nhập mã OTP",
+                expected_type="otp",
+            )
+            flow.updated_at = datetime.now()
+
+            message = TEMPLATES["topup_otp_request"].format(
+                target=topup_draft.topup_target,
+                provider=topup_draft.topup_provider or "?",
+                amount=f"{topup_draft.amount:,.0f} VND",
+            )
+
+            write_audit_log(
+                cif_no=user_id,
+                event_type="TOPUP_OTP_CHALLENGE_CREATED",
+                actor="system",
+                session_id=session_id,
+                event_payload={"challenge_id": challenge_id, "target": topup_draft.topup_target},
             )
             return {
                 "active_flow": serialize_flow(flow),
@@ -601,6 +825,11 @@ async def handle_flow_action_node(state: ChatState) -> dict:
             current_hash = hashlib.sha256(
                 f"{bd.bill_id}:{bd.amount}:{bd.customer_bill_code}".encode()
             ).hexdigest()[:32]
+        elif flow.flow_type == "TOP_UP" and flow.topup_draft:
+            td = flow.topup_draft
+            current_hash = hashlib.sha256(
+                f"{td.topup_target}:{td.amount}:{td.topup_provider}".encode()
+            ).hexdigest()[:32]
         else:
             current_hash = flow.draft.summary_hash()
 
@@ -630,6 +859,17 @@ async def handle_flow_action_node(state: ChatState) -> dict:
                     "response_message": exec_result["message"],
                     "response_data": exec_result.get("data", {}),
                 }
+            elif flow.flow_type == "TOP_UP":
+                # Execute top-up
+                flow.status = "EXECUTING"
+                exec_result = await _execute_topup(flow, user_id, session_id)
+                flow.status = "COMPLETED"
+                flow.updated_at = datetime.now()
+                return {
+                    "active_flow": None,
+                    "response_message": exec_result["message"],
+                    "response_data": exec_result.get("data", {}),
+                }
             else:
                 # Execute transaction
                 flow.draft.idempotency_key = f"{flow.flow_id}:{flow.draft.confirmation_id}"
@@ -642,6 +882,40 @@ async def handle_flow_action_node(state: ChatState) -> dict:
             message = exec_result["message"]
             if flow.interrupted_intent:
                 message += f"\n\nTiếp theo, tôi sẽ hỗ trợ bạn {_intent_display_name(flow.interrupted_intent.intent)}."
+
+            # After successful TRANSACTION execution → predict category and ask user
+            if exec_result.get("data", {}).get("executed") and flow.flow_type == "TRANSACTION":
+                tx_ref = exec_result["data"].get("ref", "")
+                category_result = await _predict_category(flow, user_id, tx_ref)
+                if category_result:
+                    # Transition to category confirmation
+                    flow.status = "WAITING_CATEGORY_CONFIRMATION"
+                    flow.category_prediction = CategoryPrediction(
+                        transaction_ref=tx_ref,
+                        predicted_category_id=category_result["predicted_category_id"],
+                        predicted_code=category_result["predicted_code"],
+                        predicted_name=category_result["predicted_name"],
+                        confidence=category_result["confidence"],
+                        alternatives=category_result["alternatives"],
+                    )
+                    flow.updated_at = datetime.now()
+
+                    # Format category question
+                    alternatives_list = "\n".join(
+                        f"  {i+1}. {alt['name']}"
+                        for i, alt in enumerate(category_result["alternatives"])
+                    )
+                    category_msg = TEMPLATES["category_confirm"].format(
+                        predicted_name=category_result["predicted_name"],
+                        alternatives_list=alternatives_list,
+                    )
+
+                    message += f"\n\n{category_msg}"
+                    return {
+                        "active_flow": serialize_flow(flow),
+                        "response_message": message,
+                        "response_data": exec_result.get("data", {}),
+                    }
 
             return {
                 "active_flow": None,
@@ -689,6 +963,20 @@ async def handle_flow_action_node(state: ChatState) -> dict:
         if not flow:
             return {"response_message": "Không có giao dịch nào để hủy."}
 
+        # Category skip: save predicted value silently
+        if flow.status == "WAITING_CATEGORY_CONFIRMATION" and flow.category_prediction:
+            _category_classifier.update_category(
+                flow.category_prediction.transaction_ref,
+                flow.category_prediction.predicted_category_id,
+            )
+            message = TEMPLATES["category_saved_default"].format(
+                category_name=flow.category_prediction.predicted_name
+            )
+            return {
+                "active_flow": None,
+                "response_message": message,
+            }
+
         if flow.otp_challenge_id:
             otp_service.invalidate(flow.otp_challenge_id)
 
@@ -719,6 +1007,9 @@ async def handle_flow_action_node(state: ChatState) -> dict:
             if flow.flow_type == "BILL_PAYMENT" and flow.bill_draft:
                 amount_str = f"{flow.bill_draft.amount:,.0f} VND" if flow.bill_draft.amount else "?"
                 name_str = flow.bill_draft.biller_name or "hóa đơn"
+            elif flow.flow_type == "TOP_UP" and flow.topup_draft:
+                amount_str = f"{flow.topup_draft.amount:,.0f} VND" if flow.topup_draft.amount else "?"
+                name_str = flow.topup_draft.topup_target or "nạp tiền"
             else:
                 amount_str = f"{flow.draft.amount:,.0f} VND" if flow.draft and flow.draft.amount else "?"
                 name_str = flow.draft.recipient_name if flow.draft else "?"
@@ -1495,3 +1786,210 @@ async def _execute_bill_payment(flow: FlowState, user_id: str, session_id: str) 
             "message": f"Thanh toán thất bại: {result.message}",
             "data": {"executed": False, "error": result.error_code},
         }
+
+
+# ─── Top-Up Helpers ───────────────────────────────────────────────────────────
+
+
+def _handle_topup_collecting(
+    flow: FlowState,
+    user_id: str,
+    response_data: dict,
+) -> tuple[FlowState, str]:
+    """Handle top-up flow collecting state.
+
+    Validation logic:
+    1. Need topup_target (phone number)
+    2. Need amount (10k-500k for phone, 10k-10M for wallet)
+    3. Validate phone format
+    4. If both present → show confirmation
+    """
+    import re
+
+    topup_draft = flow.topup_draft
+    if not topup_draft:
+        topup_draft = TopUpDraft()
+        flow.topup_draft = topup_draft
+
+    # Apply agent_result if available
+    agent_result = response_data.get("agent_result", {})
+    if agent_result:
+        if agent_result.get("topup_target"):
+            topup_draft.topup_target = agent_result["topup_target"]
+        if agent_result.get("topup_provider"):
+            topup_draft.topup_provider = agent_result["topup_provider"]
+        if agent_result.get("topup_type"):
+            topup_draft.topup_type = agent_result["topup_type"]
+        if agent_result.get("amount"):
+            topup_draft.amount = agent_result["amount"]
+
+    # Default type
+    if not topup_draft.topup_type:
+        topup_draft.topup_type = "phone"
+
+    # Step 1: Need phone number?
+    if not topup_draft.topup_target:
+        flow.pending_question = PendingQuestion(
+            slot="topup_target",
+            question=TEMPLATES["topup_need_phone"],
+            expected_type="text",
+        )
+        flow.status = "COLLECTING"
+        return flow, TEMPLATES["topup_need_phone"]
+
+    # Step 2: Validate phone format
+    phone = topup_draft.topup_target.strip()
+    if not re.match(r"^0\d{9}$", phone):
+        flow.pending_question = PendingQuestion(
+            slot="topup_target",
+            question=TEMPLATES["topup_invalid_phone"],
+            expected_type="text",
+        )
+        topup_draft.topup_target = None
+        flow.status = "COLLECTING"
+        return flow, TEMPLATES["topup_invalid_phone"]
+
+    # Step 3: Detect provider from prefix if not set
+    if not topup_draft.topup_provider:
+        topup_draft.topup_provider = _detect_carrier(phone)
+
+    # Step 4: Need amount?
+    if not topup_draft.amount:
+        message = TEMPLATES["topup_need_amount"].format(target=phone)
+        flow.pending_question = PendingQuestion(
+            slot="topup_amount",
+            question=message,
+            expected_type="amount",
+        )
+        flow.status = "COLLECTING"
+        return flow, message
+
+    # Step 5: Validate amount
+    max_amount = 500_000 if topup_draft.topup_type == "phone" else 10_000_000
+    if topup_draft.amount < 10_000 or topup_draft.amount > max_amount:
+        message = TEMPLATES["topup_amount_invalid"].format(
+            max_amount=f"{max_amount:,.0f}",
+        )
+        topup_draft.amount = None
+        flow.pending_question = PendingQuestion(
+            slot="topup_amount",
+            question=message,
+            expected_type="amount",
+        )
+        flow.status = "COLLECTING"
+        return flow, message
+
+    # Step 6: All valid → show confirmation
+    flow.status = "WAITING_TOPUP_CONFIRMATION"
+    flow.pending_question = PendingQuestion(
+        slot="topup_confirmation",
+        question="Xác nhận nạp tiền",
+        expected_type="enum",
+        options=[{"value": "confirm"}, {"value": "cancel"}],
+    )
+    message = TEMPLATES["topup_confirm"].format(
+        target=phone,
+        provider=topup_draft.topup_provider or "Không xác định",
+        amount=f"{topup_draft.amount:,.0f} VND",
+    )
+    return flow, message
+
+
+def _detect_carrier(phone: str) -> str:
+    """Detect Vietnamese carrier from phone prefix."""
+    prefix3 = phone[:3]
+    prefix4 = phone[:4]
+
+    # Viettel: 086, 096, 097, 098, 032-036
+    if prefix3 in ("086", "096", "097", "098"):
+        return "Viettel"
+    if prefix4 in ("0320", "0321", "0322", "0323", "0324", "0325", "0326", "0327", "0328", "0329",
+                   "0330", "0331", "0332", "0333", "0334", "0335", "0336", "0337", "0338", "0339",
+                   "0340", "0341", "0342", "0343", "0344", "0345", "0346", "0347", "0348", "0349",
+                   "0350", "0351", "0352", "0353", "0354", "0355", "0356", "0357", "0358", "0359",
+                   "0360", "0361", "0362", "0363", "0364", "0365", "0366", "0367", "0368", "0369"):
+        return "Viettel"
+
+    # Mobifone: 089, 090, 093, 070-079
+    if prefix3 in ("089", "090", "093"):
+        return "Mobifone"
+    if prefix3 in ("070", "071", "072", "073", "074", "075", "076", "077", "078", "079"):
+        return "Mobifone"
+
+    # Vinaphone: 088, 091, 094, 081-085
+    if prefix3 in ("088", "091", "094"):
+        return "Vinaphone"
+    if prefix3 in ("081", "082", "083", "084", "085"):
+        return "Vinaphone"
+
+    # Vietnamobile: 092, 056, 058
+    if prefix3 in ("092", "056", "058"):
+        return "Vietnamobile"
+
+    return "Không xác định"
+
+
+async def _execute_topup(flow: FlowState, user_id: str, session_id: str) -> dict:
+    """Execute top-up via TopUpExecutor."""
+    from backend.executor.topup_executor import TopUpExecutor
+
+    topup_draft = flow.topup_draft
+    executor = TopUpExecutor()
+
+    exec_draft = {
+        "topup_target": topup_draft.topup_target,
+        "topup_provider": topup_draft.topup_provider,
+        "topup_type": topup_draft.topup_type or "phone",
+        "amount": topup_draft.amount,
+    }
+
+    result = await executor.execute(
+        draft=exec_draft,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+    if result.success:
+        message = TEMPLATES["topup_success"].format(
+            ref=result.transaction_ref or "N/A",
+            time=datetime.now().strftime("%d/%m/%Y %H:%M"),
+            target=topup_draft.topup_target or "?",
+            provider=topup_draft.topup_provider or "?",
+            amount=f"{topup_draft.amount:,.0f} VND" if topup_draft.amount else "?",
+            balance=f"{result.balance_after:,.0f} VND" if result.balance_after else "?",
+        )
+        return {"message": message, "data": {"executed": True, "ref": result.transaction_ref}}
+    else:
+        return {
+            "message": f"Nạp tiền thất bại: {result.message}",
+            "data": {"executed": False, "error": result.error_code},
+        }
+
+
+# ─── Category Prediction Helper ──────────────────────────────────────────────
+
+
+async def _predict_category(flow: FlowState, user_id: str, tx_ref: str) -> dict | None:
+    """Predict category for a completed transaction.
+
+    Returns prediction dict or None if prediction fails/not applicable.
+    """
+    draft = flow.draft
+    if not draft:
+        return None
+
+    try:
+        prediction = await _category_classifier.predict(
+            user_id=user_id,
+            description=draft.transfer_note or f"Chuyen tien cho {draft.recipient_name}",
+            amount=draft.amount or 0,
+            counterparty_name=draft.recipient_name,
+            counterparty_account_no=draft.recipient_account_no,
+            bank_code=draft.recipient_bank_code,
+        )
+        if prediction and prediction.get("predicted_category_id"):
+            return prediction
+    except Exception as e:
+        logger.error(f"[CATEGORY] Prediction failed: {e}")
+
+    return None

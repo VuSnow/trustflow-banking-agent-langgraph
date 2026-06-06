@@ -63,6 +63,20 @@ class TopUpDraft(BaseModel):
     amount: int | None = None
 
 
+# ─── CategoryPrediction ───────────────────────────────────────────────────────
+
+
+class CategoryPrediction(BaseModel):
+    """LLM prediction for transaction category — stored post-execution."""
+
+    transaction_ref: str
+    predicted_category_id: str
+    predicted_code: str
+    predicted_name: str
+    confidence: float = 0.5
+    alternatives: list[dict] = Field(default_factory=list)  # [{category_id, code, name}]
+
+
 # ─── TransactionDraft ─────────────────────────────────────────────────────────
 
 
@@ -153,6 +167,7 @@ class FlowState(BaseModel):
         "WAITING_RECIPIENT_CONFIRMATION",
         "WAITING_DRAFT_CONFIRMATION",
         "WAITING_OTP",
+        "WAITING_CATEGORY_CONFIRMATION",
         "EXECUTING",
         "COMPLETED",
         "CANCELLED",
@@ -161,6 +176,7 @@ class FlowState(BaseModel):
     draft: TransactionDraft | None = None
     bill_draft: BillDraft | None = None
     topup_draft: TopUpDraft | None = None
+    category_prediction: CategoryPrediction | None = None
     pending_question: PendingQuestion | None = None
     interrupted_intent: InterruptedIntent | None = None
 
@@ -187,6 +203,7 @@ class FlowState(BaseModel):
             "WAITING_TOPUP_CONFIRMATION",
         ):
             return "limited"
+        # WAITING_CATEGORY_CONFIRMATION is flexible — user can freely switch intent
         return "flexible"
 
 
