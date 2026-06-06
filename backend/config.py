@@ -10,7 +10,7 @@ TEXT2SQL_AGENT_URL = os.getenv("TEXT2SQL_AGENT_URL", "http://localhost:8080")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://dungvu:dungvu@localhost:5432/banking_mcp_test")
 CURRENT_BANK_CODE = os.getenv("CURRENT_BANK_CODE", "SHB")
 MOCK_OTP_CODE = os.getenv("MOCK_OTP_CODE", "123456")
-LOG_DIR = Path(os.getenv("LOG_DIR", "/home/ubuntu/workspace/logs"))
+LOG_DIR = Path(os.getenv("LOG_DIR", "./logs"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Langfuse
