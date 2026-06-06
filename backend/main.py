@@ -3,6 +3,7 @@
 FastAPI entrypoint with LangGraph-based orchestration.
 """
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -14,9 +15,17 @@ from backend.services.chat_session_store import ChatSessionStore
 from backend.routes import router as sessions_router, init as init_sessions
 from backend.routes.chat import router as chat_router, init as init_chat
 
+LOG_DIR = Path("/home/ubuntu/workspace/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "trustflow-banking.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(LOG_FILE, maxBytes=10_000_000, backupCount=5, encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 

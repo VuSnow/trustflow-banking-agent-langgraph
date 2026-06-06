@@ -5,6 +5,7 @@ No LLM involved — pure deterministic execution.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import psycopg2
@@ -46,8 +47,9 @@ class TransactionExecutor:
                 message="Không tìm thấy tài khoản thanh toán. Vui lòng liên hệ ngân hàng.",
             )
 
-        # 2. Build idempotency key from draft contents
-        idempotency_key = f"{session_id}:{draft.get('account_no')}:{draft.get('amount')}"
+        # 2. Build idempotency key from draft contents (max 30 chars for DB column)
+        raw_key = f"{session_id}:{draft.get('account_no')}:{draft.get('amount')}"
+        idempotency_key = hashlib.sha256(raw_key.encode()).hexdigest()[:30]
 
         # 3. Call banking API
         api_response = await call_transfer_api(
