@@ -71,6 +71,11 @@ _CANCEL_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+_SKIP_CATEGORY_PATTERNS = re.compile(
+    r"^(bỏ qua|skip|bỏ|không cần|thôi|ko cần)$",
+    re.IGNORECASE,
+)
+
 _MODIFY_KEYWORDS = re.compile(
     r"(đổi|sửa|thay|chỉnh|modify|change|update|edit|giảm|tăng|bớt|thêm)",
     re.IGNORECASE,
@@ -117,7 +122,8 @@ class FlowRouter:
         1. No flow → new intent
         2. Locked (WAITING_OTP) → OTP or cancel only
         3. Limited (confirmations) → confirm/cancel/modify
-        4. Flexible (COLLECTING) → continue or detect switch
+        4. Category confirmation (flexible, soft ask)
+        5. Flexible (COLLECTING) → continue or detect switch
         """
         msg = message.strip()
 
@@ -135,10 +141,15 @@ class FlowRouter:
             "WAITING_DRAFT_CONFIRMATION",
             "WAITING_BILL_CONFIRMATION",
             "WAITING_TOPUP_CONFIRMATION",
+            "WAITING_CARD_CONFIRMATION",
         ):
             return await self._route_confirmation(msg)
 
-        # 4. Flexible: COLLECTING
+        # 4. Category confirmation (post-execution soft ask)
+        if flow.status == "WAITING_CATEGORY_CONFIRMATION":
+            return self._route_category_confirmation(msg, flow)
+
+        # 5. Flexible: COLLECTING
         if flow.status == "COLLECTING":
             # Check if pending question can be answered structurally
             if flow.pending_question:
@@ -194,11 +205,42 @@ class FlowRouter:
         else:
             return RouteDecision(action="ASK_VALID_INPUT")
 
+    def _route_category_confirmation(self, msg: str, flow: FlowState) -> RouteDecision:
+        """Route in WAITING_CATEGORY_CONFIRMATION — soft ask, user can freely switch.
+
+        - Confirm → save predicted category
+        - Number selection → save user's chosen alternative
+        - Skip → save predicted category silently
+        - Anything else → save predicted category + treat as new intent
+        """
+        # User confirms the predicted category
+        if _CONFIRM_PATTERNS.match(msg):
+            return RouteDecision(action="CONFIRM")
+
+        # User says skip/bỏ qua
+        if _SKIP_CATEGORY_PATTERNS.match(msg):
+            return RouteDecision(action="CANCEL_ACTIVE_FLOW")
+
+        # User picks an alternative by number (e.g., "2", "3")
+        if re.match(r"^\d+$", msg):
+            idx = int(msg) - 1
+            prediction = flow.category_prediction
+            if prediction and prediction.alternatives and 0 <= idx < len(prediction.alternatives):
+                return RouteDecision(
+                    action="ANSWER_PENDING_QUESTION",
+                    data={"category_choice": prediction.alternatives[idx]},
+                )
+            # Invalid number → treat as new intent
+            return RouteDecision(action="CLASSIFY_NEW_INTENT")
+
+        # Anything else → user switched topic, save predicted and route new intent
+        return RouteDecision(action="CLASSIFY_NEW_INTENT")
+
     def _try_structural_answer(
         self, pending: PendingQuestion, msg: str
     ) -> RouteDecision | None:
         """Try to answer a pending question without LLM."""
-        if pending.expected_type == "recipient_choice":
+        if pending.expected_type in ("recipient_choice", "enum"):
             # Expecting a number like "1", "2", "3"
             if re.match(r"^\d+$", msg):
                 idx = int(msg) - 1

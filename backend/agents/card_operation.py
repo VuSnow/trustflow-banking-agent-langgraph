@@ -1,127 +1,93 @@
-"""Card Operation Agent — LangGraph implementation with tool-calling."""
+"""Card Operation Extractor — pure LLM entity extraction for card operations.
+
+Design principle: Agent ONLY extracts what card + what operation.
+Orchestrator resolves card, validates, asks confirmation, and executes.
+NO tools, NO SQL — just structured extraction from user's message.
+"""
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from backend.config import OPENAI_API_KEY, OPENAI_MODEL
-from backend.tools.card_tools import CARD_TOOLS
-from backend.prompts.card_operation import CARD_OPERATION_SYSTEM_PROMPT
+from backend.prompts.card_operation import CARD_EXTRACT_SYSTEM_PROMPT
 from backend.services.langfuse_trace import get_trace_config
 
 logger = logging.getLogger(__name__)
 
 
-def create_card_agent():
-    """Create the card operation agent graph."""
-    llm = ChatOpenAI(
-        model=OPENAI_MODEL,
-        api_key=OPENAI_API_KEY,
-        temperature=0.0,
-    )
+@dataclass
+class CardExtractionResult:
+    """Output from card operation extraction."""
 
-    agent = create_react_agent(
-        model=llm,
-        tools=CARD_TOOLS,
-        prompt=SystemMessage(content=CARD_OPERATION_SYSTEM_PROMPT),
-    )
-    return agent
+    operation: str | None = None  # LOCK_CARD, UNLOCK_CARD, REPORT_LOST, VIEW_CARD_INFO
+    card_hint_last4: str | None = None  # "4223"
+    card_hint_type: str | None = None  # "DEBIT" / "CREDIT"
+    card_hint_network: str | None = None  # "VISA" / "MASTERCARD" / "NAPAS"
+    interpretation: str = ""
 
 
-async def run_card_agent(
-    message: str,
-    user_id: str,
-    session_id: str,
-    history: list[dict] | None = None,
-) -> dict:
-    """Run the card operation agent and return structured output."""
-    agent = create_card_agent()
+class CardOperationExtractor:
+    """Extract card operation intent and card hints from user message."""
 
-    messages = []
-    if history:
-        for msg in history[-10:]:
-            role = msg.get("role", "user")
-            content = msg.get("message", "")
-            if role == "user" and content:
-                messages.append(HumanMessage(content=content))
-            elif role == "assistant" and content:
-                messages.append(AIMessage(content=content))
-
-    messages.append(HumanMessage(content=message))
-
-    try:
-        config = get_trace_config(
-            session_id=session_id,
-            user_id=user_id,
-            trace_name="card_agent",
+    def __init__(self):
+        self._llm = ChatOpenAI(
+            model=OPENAI_MODEL,
+            api_key=OPENAI_API_KEY,
+            temperature=0.0,
         )
-        config.setdefault("recursion_limit", 25)
-        result = await agent.ainvoke({"messages": messages}, config=config)
-        final_messages = result.get("messages", [])
-        if final_messages:
-            last_msg = final_messages[-1]
-            raw_content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
-        else:
-            raw_content = ""
 
-        return _parse_card_output(raw_content)
+    async def process(
+        self,
+        message: str,
+        user_id: str,
+        cards_context: str = "",
+        session_id: str = "",
+    ) -> CardExtractionResult:
+        """Extract operation and card hints from user's message.
 
-    except Exception as e:
-        logger.error(f"[CARD AGENT] Error: {e}", exc_info=True)
-        return {
-            "status": "clarification_needed",
-            "message": "Xin lỗi, tôi không thể xử lý yêu cầu thẻ lúc này.",
-            "data": {"error": str(e)},
-        }
+        Args:
+            message: User's message
+            user_id: Customer CIF
+            cards_context: Formatted list of user's cards (for disambiguation)
+            session_id: For tracing
+        """
+        user_prompt = f"User cards:\n{cards_context}\n\nUser message: {message}"
 
+        try:
+            config = get_trace_config(
+                session_id=session_id,
+                user_id=user_id,
+                trace_name="card_extractor",
+            )
+            response = await self._llm.ainvoke(
+                [
+                    SystemMessage(content=CARD_EXTRACT_SYSTEM_PROMPT),
+                    HumanMessage(content=user_prompt),
+                ],
+                config=config,
+            )
 
-def _parse_card_output(raw: str) -> dict:
-    """Parse card agent output."""
-    try:
-        content = raw.strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            content = "\n".join(lines)
+            raw = response.content.strip()
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                lines = [l for l in lines if not l.strip().startswith("```")]
+                raw = "\n".join(lines)
 
-        data = json.loads(content)
-        status = data.get("status", "")
+            data = json.loads(raw)
 
-        if status == "draft_created":
-            return {
-                "status": "draft_ready",
-                "message": data.get("message", "Xác nhận thao tác thẻ?"),
-                "data": data,
-            }
-        elif status == "info_response":
-            return {
-                "status": "info_response",
-                "message": data.get("message", ""),
-                "data": data.get("data", data),
-            }
-        elif status == "needs_clarification":
-            return {
-                "status": "clarification_needed",
-                "message": data.get("message", "Vui lòng cung cấp thêm thông tin."),
-                "data": data,
-            }
-        elif status == "cancelled":
-            return {
-                "status": "info_response",
-                "message": data.get("message", "Đã hủy thao tác."),
-                "data": {},
-            }
-        elif status == "error":
-            return {
-                "status": "info_response",
-                "message": data.get("message", "Không thể thực hiện thao tác."),
-                "data": data,
-            }
-        else:
-            return {"status": "info_response", "message": raw, "data": data}
-    except (json.JSONDecodeError, TypeError):
-        return {"status": "info_response", "message": raw or "Lỗi xử lý.", "data": {}}
+            return CardExtractionResult(
+                operation=data.get("operation"),
+                card_hint_last4=data.get("card_hint_last4"),
+                card_hint_type=data.get("card_hint_type"),
+                card_hint_network=data.get("card_hint_network"),
+                interpretation=data.get("interpretation", ""),
+            )
+
+        except Exception as e:
+            logger.error(f"[CARD_EXTRACTOR] Error: {e}", exc_info=True)
+            return CardExtractionResult(interpretation=f"Error: {e}")
