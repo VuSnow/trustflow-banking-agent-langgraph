@@ -951,7 +951,7 @@ async def handle_flow_action_node(state: ChatState) -> dict:
                     "active_flow": None,
                     "response_message": TEMPLATES["fraud_block"],
                 }
-            message = _build_draft_summary_message(flow)
+            message = _build_draft_summary_message(flow, user_id)
             flow.updated_at = datetime.now()
 
             write_audit_log(
@@ -1526,7 +1526,7 @@ def _determine_next_step(flow: FlowState, user_id: str) -> tuple[FlowState, str]
 
     # Already verified
     if draft.recipient_verified and draft.amount:
-        return flow, _build_draft_summary_message(flow)
+        return flow, _build_draft_summary_message(flow, user_id)
 
     return flow, "Đang xử lý..."
 
@@ -1534,6 +1534,10 @@ def _determine_next_step(flow: FlowState, user_id: str) -> tuple[FlowState, str]
 async def _handle_recipient_confirmed(flow: FlowState, user_id: str) -> FlowState:
     """After user confirms recipient: verify, fraud check, compute fee."""
     draft = flow.draft
+
+    # Resolve bank_code from bank_name if code is missing/unknown
+    if (not draft.recipient_bank_code or draft.recipient_bank_code.lower() == "unknown") and draft.recipient_bank_name:
+        draft.recipient_bank_code = draft.recipient_bank_name.upper()
 
     # Verify via banking API
     verification = _recipient_resolver.verify_recipient(
@@ -1596,14 +1600,28 @@ async def _handle_recipient_confirmed(flow: FlowState, user_id: str) -> FlowStat
     return flow
 
 
-def _build_draft_summary_message(flow: FlowState) -> str:
+def _build_draft_summary_message(flow: FlowState, user_id: str = "") -> str:
     """Build transaction summary for user confirmation."""
     draft = flow.draft
     if not draft:
         return ""
 
+    # Risk gauge (replaces simple text warning)
+    from backend.services.risk_assessor import assess_transaction_risk, format_risk_gauge
+
+    risk_result = assess_transaction_risk(
+        user_id=user_id,
+        recipient_account_no=draft.recipient_account_no or "",
+        recipient_bank_code=draft.recipient_bank_code,
+        amount=draft.amount,
+        fraud_screening=draft.fraud_screening,
+    )
+    risk_gauge = format_risk_gauge(risk_result)
+
     warning = ""
-    if draft.fraud_screening and draft.fraud_screening.get("is_reported"):
+    if risk_gauge:
+        warning = risk_gauge + "\n\n"
+    elif draft.fraud_screening and draft.fraud_screening.get("is_reported"):
         risk = draft.fraud_screening.get("risk_level", "LOW")
         if risk == "HIGH":
             warning = TEMPLATES["fraud_warning_high"].format(

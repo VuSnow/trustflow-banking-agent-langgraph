@@ -328,6 +328,144 @@ button {
   font-weight: 700;
 }
 
+.message-text .risk-gauge-card {
+  margin: 0 0 0.9rem;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(180deg, rgba(245, 247, 251, 0.16) 0%, rgba(255, 255, 255, 0.08) 100%);
+}
+
+.message-text .risk-gauge-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.message-text .risk-gauge-card__title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 760;
+}
+
+.message-text .risk-gauge-card__chip {
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 0.78rem;
+  font-weight: 760;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.message-text .risk-gauge-card--high .risk-gauge-card__chip {
+  background: rgba(239, 68, 68, 0.22);
+  border: 1px solid rgba(252, 165, 165, 0.45);
+  color: #fecaca;
+}
+
+.message-text .risk-gauge-card--medium .risk-gauge-card__chip {
+  background: rgba(245, 158, 11, 0.2);
+  border: 1px solid rgba(252, 211, 77, 0.4);
+  color: #fde68a;
+}
+
+.message-text .risk-gauge-card__score-title {
+  margin-bottom: 8px;
+  color: rgba(238, 242, 232, 0.85);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.8rem;
+  font-weight: 720;
+}
+
+.message-text .risk-gauge-card__score-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.message-text .risk-gauge-card__score-label {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.message-text .risk-gauge-card__score-value {
+  color: #ffc7c7;
+  font-family: "JetBrains Mono", "Consolas", monospace;
+  font-size: 1.02rem;
+  font-weight: 700;
+}
+
+.message-text .risk-meter {
+  position: relative;
+  width: 100%;
+  height: 14px;
+  margin-bottom: 8px;
+}
+
+.message-text .risk-meter__bar {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #10b981 0%, #f59e0b 55%, #ef4444 100%);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+}
+
+.message-text .risk-meter__thumb {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff6f6;
+  border: 3px solid #ef4444;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.22);
+}
+
+.message-text .risk-meter__legend {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 10px;
+  font-weight: 640;
+  font-size: 0.9rem;
+}
+
+.message-text .risk-meter__legend span:nth-child(1) {
+  color: #34d399;
+  text-align: left;
+}
+
+.message-text .risk-meter__legend span:nth-child(2) {
+  color: #fbbf24;
+  text-align: center;
+}
+
+.message-text .risk-meter__legend span:nth-child(3) {
+  color: #f87171;
+  text-align: right;
+}
+
+.message-text .risk-gauge-card__signals {
+  margin: 0 0 0.7rem;
+  padding: 0 0 0 1.1rem;
+  color: var(--muted);
+}
+
+.message-text .risk-gauge-card__signals li {
+  margin-bottom: 0.22rem;
+}
+
+.message-text .risk-gauge-card__question {
+  margin: 0;
+  font-weight: 640;
+}
+
 .message-text ul,
 .message-text ol {
   padding-left: 1.4rem;
@@ -466,5 +604,16 @@ button {
 
   .workspace {
     min-height: auto;
+  }
+
+  .message-text .risk-gauge-card__header,
+  .message-text .risk-gauge-card__score-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .message-text .risk-gauge-card__chip {
+    font-size: 0.74rem;
   }
 }

@@ -263,7 +263,7 @@ class RecipientResolver:
                         WHERE account_no = %s
                     """
                     params: list = [account_no]
-                    if bank_code:
+                    if bank_code and bank_code.upper() not in ("UNKNOWN", ""):
                         query += " AND bank_code = %s"
                         params.append(bank_code.upper())
                     query += " LIMIT 1"
