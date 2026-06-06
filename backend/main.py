@@ -15,7 +15,7 @@ from backend.services.chat_session_store import ChatSessionStore
 from backend.routes import router as sessions_router, init as init_sessions
 from backend.routes.chat import router as chat_router, init as init_chat
 
-LOG_DIR = Path("/home/ubuntu/workspace/logs")
+LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "trustflow-banking.log"
 

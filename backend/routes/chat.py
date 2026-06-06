@@ -7,7 +7,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 
-from backend.graphs.orchestrator import compile_orchestrator
+from backend.graphs.orchestrator import compile_orchestrator, get_checkpointer
+from backend.models.flow import deserialize_flow
 from backend.services.chat_session_store import ChatSessionStore
 from backend.services.audit_log import write_audit_log
 from backend.services.langfuse_trace import get_trace_config
@@ -22,9 +23,17 @@ orchestrator_graph = None
 
 
 def init(store: ChatSessionStore):
-    global chat_session_store, orchestrator_graph
+    global chat_session_store
     chat_session_store = store
-    orchestrator_graph = compile_orchestrator()
+    # Graph compiled lazily on first request (needs async for PostgresSaver)
+
+
+async def _get_graph():
+    """Lazy-initialize orchestrator graph with async checkpointer."""
+    global orchestrator_graph
+    if orchestrator_graph is None:
+        orchestrator_graph = await compile_orchestrator()
+    return orchestrator_graph
 
 
 # ─── Request/Response models ─────────────────────────────────────────────────
@@ -39,8 +48,7 @@ class ChatResponse(BaseModel):
     status: str
     message: str
     data: dict | None = None
-    pending_action_id: str | None = None
-    risk_tier: str | None = None
+    flow_status: str | None = None
     auth_required: str | None = None
 
 
@@ -64,40 +72,26 @@ async def chat_endpoint(request: ChatRequest):
         message=request.message,
     )
 
-    # With checkpointing (MemorySaver), state persists between calls via thread_id.
-    # We need to check if there's an existing checkpoint to get fsm_state/pending_draft.
-    from backend.graphs.orchestrator import get_checkpointer
-    checkpointer = get_checkpointer()
+    # Restore active_flow from checkpoint
+    checkpointer = await get_checkpointer()
 
-    existing_state = None
+    active_flow = None
     thread_config = {"configurable": {"thread_id": request.session_id}}
     try:
-        checkpoint = checkpointer.get(thread_config)
-        if checkpoint and checkpoint.get("channel_values"):
-            existing_state = checkpoint["channel_values"]
+        checkpoint_tuple = await checkpointer.aget_tuple(thread_config)
+        if checkpoint_tuple and checkpoint_tuple.checkpoint.get("channel_values"):
+            active_flow = checkpoint_tuple.checkpoint["channel_values"].get("active_flow")
     except Exception:
         pass
-
-    fsm_state = "idle"
-    pending_draft = None
-    if existing_state:
-        fsm_state = existing_state.get("fsm_state", "idle") or "idle"
-        pending_draft = existing_state.get("pending_draft")
 
     graph_input = {
         "messages": [HumanMessage(content=request.message)],
         "user_id": request.user_id,
         "session_id": request.session_id,
-        "intent": "",
-        "operation": None,
-        "confidence": 0.0,
-        "response_status": "",
+        "active_flow": active_flow,
+        "route_decision": None,
         "response_message": "",
         "response_data": {},
-        "fsm_state": fsm_state,
-        "pending_draft": pending_draft,
-        "pipeline_step": 0,
-        "pipeline_results": [],
     }
 
     # Run the graph with thread_id for checkpointing
@@ -107,12 +101,12 @@ async def chat_endpoint(request: ChatRequest):
             user_id=request.user_id,
             trace_name="orchestrator",
         )
-        # thread_id enables checkpoint-based state persistence
         config.setdefault("configurable", {})
         config["configurable"]["thread_id"] = request.session_id
-        config.setdefault("recursion_limit", 50)
+        config.setdefault("recursion_limit", 25)
 
-        result = await orchestrator_graph.ainvoke(graph_input, config=config)
+        graph = await _get_graph()
+        result = await graph.ainvoke(graph_input, config=config)
     except Exception as e:
         logger.error(f"[GRAPH] Error: {e}", exc_info=True)
         response = ChatResponse(
@@ -123,26 +117,31 @@ async def chat_endpoint(request: ChatRequest):
         return response
 
     # Extract response from graph state
-    response_status = result.get("response_status", "info_response")
     response_message = result.get("response_message", "")
     response_data = result.get("response_data", {})
-    new_fsm_state = result.get("fsm_state", "idle")
+    result_flow = deserialize_flow(result.get("active_flow"))
 
-    # Map to API response
-    risk_tier = None
+    # Determine status and auth_required from flow state
+    flow_status = None
     auth_required = None
-    if response_status == "blocked":
-        risk_tier = "RED"
-    elif new_fsm_state == "waiting_otp":
-        auth_required = "otp"
-    elif new_fsm_state == "waiting_confirmation":
-        auth_required = "confirm"
+    status = "success"
+
+    if result_flow:
+        flow_status = result_flow.status
+        if result_flow.status == "WAITING_OTP":
+            auth_required = "otp"
+        elif result_flow.status in ("WAITING_RECIPIENT_CONFIRMATION", "WAITING_DRAFT_CONFIRMATION"):
+            auth_required = "confirm"
+        elif result_flow.status == "COLLECTING":
+            status = "collecting"
+    else:
+        status = "completed" if response_data.get("executed") else "success"
 
     response = ChatResponse(
-        status=response_status,
+        status=status,
         message=response_message,
         data=response_data if response_data else None,
-        risk_tier=risk_tier,
+        flow_status=flow_status,
         auth_required=auth_required,
     )
 

@@ -53,13 +53,16 @@ You do NOT handle money transfers to people or card operations.
 ```
 
 ### When multiple billers of same type:
+List them clearly with numbered options so the user can pick one.
+Include alias, biller name, customer_bill_code, and unpaid amount if available.
 ```json
 {
   "status": "needs_clarification",
-  "message": "Bạn có 3 tài khoản điện. Bạn muốn thanh toán cho tài khoản nào?",
+  "message": "Bạn có 3 tài khoản điện. Bạn muốn thanh toán cho tài khoản nào?\n\n1. EVN Hà Nội — Mã KH: PD111222333 (Nhà bố mẹ)\n2. EVN Miền Nam — Mã KH: PD444555666 (Công ty) — Hóa đơn kỳ 05/2026: 1,245,000 VND\n3. EVN Miền Trung — Mã KH: PD867472238 (Nhà Hà Nội)\n\nVui lòng chọn số thứ tự hoặc tên tài khoản.",
   "candidates": [
-    {"biller_name": "EVN Mien Trung", "customer_bill_code": "PD867472238", "alias": "Nha Ha Noi"},
-    {"biller_name": "EVN Ha Noi", "customer_bill_code": "PD111222333", "alias": "Nha bo me"}
+    {"biller_name": "EVN Ha Noi", "customer_bill_code": "PD111222333", "alias": "Nha bo me"},
+    {"biller_name": "EVN Mien Nam", "customer_bill_code": "PD444555666", "alias": "Cong ty", "unpaid_bill": {"bill_id": "...", "bill_period": "2026-05", "amount_due": 1245000}},
+    {"biller_name": "EVN Mien Trung", "customer_bill_code": "PD867472238", "alias": "Nha Ha Noi"}
   ]
 }
 ```
