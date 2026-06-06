@@ -66,3 +66,8 @@ async def web_ui():
     if not FRONTEND_INDEX_PATH.exists():
         return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
     return HTMLResponse(FRONTEND_INDEX_PATH.read_text())
+
+
+@app.get("/web_ui/")
+async def web_ui_slash():
+    return RedirectResponse(url="/web_ui", status_code=307)

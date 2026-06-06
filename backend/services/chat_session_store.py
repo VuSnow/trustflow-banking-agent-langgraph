@@ -16,12 +16,45 @@ class ChatSessionStore:
 
     def __init__(self, dsn: str | None = None):
         self.dsn = dsn or DATABASE_URL
+        self._ensure_indexes()
 
     def _connect(self):
         return psycopg2.connect(self.dsn)
 
+    def _ensure_indexes(self) -> None:
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    ALTER TABLE chat_sessions
+                    ADD COLUMN IF NOT EXISTS message_count INTEGER DEFAULT 0
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_updated_at
+                    ON chat_sessions (user_id, updated_at DESC)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created_at
+                    ON chat_messages (session_id, created_at DESC)
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     def _now(self) -> str:
         return datetime.now().isoformat(timespec="seconds")
+
+    def _row_to_session(self, row, *, messages: list[dict] | None = None) -> dict:
+        session = dict(row)
+        if messages is not None:
+            session["messages"] = messages
+        return session
 
     def create_session(self, user_id: str, title: str | None = None, session_id: str | None = None) -> dict:
         session_id = session_id or str(uuid4())
@@ -32,13 +65,23 @@ class ChatSessionStore:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO chat_sessions (session_id, user_id, title, status, created_at, updated_at, last_message_at)
-                    VALUES (%s, %s, %s, 'active', %s, %s, %s)
+                    INSERT INTO chat_sessions (session_id, user_id, title, status, created_at, updated_at, last_message_at, message_count)
+                    VALUES (%s, %s, %s, 'active', %s, %s, %s, 0)
                     """,
                     (session_id, user_id, title, now, now, now),
                 )
             conn.commit()
-            return self.get_session(session_id)
+            return {
+                "session_id": session_id,
+                "user_id": user_id,
+                "title": title,
+                "status": "active",
+                "created_at": now,
+                "updated_at": now,
+                "message_count": 0,
+                "last_message_at": now,
+                "messages": [],
+            }
         finally:
             conn.close()
 
@@ -57,19 +100,24 @@ class ChatSessionStore:
                 cur.execute(
                     """
                     SELECT s.session_id, s.user_id, s.title, s.status, s.created_at, s.updated_at,
-                           COALESCE(COUNT(m.id), 0) AS message_count,
-                           MAX(m.created_at) AS last_message_at
+                           COALESCE(s.message_count, 0) AS message_count,
+                           s.last_message_at
                     FROM chat_sessions s
-                    LEFT JOIN chat_messages m ON m.session_id = s.session_id
                     WHERE s.session_id = %s
-                    GROUP BY s.session_id LIMIT 1
                     """,
                     (session_id,),
                 )
                 row = cur.fetchone()
-            return dict(row) if row else None
+            return self._row_to_session(row) if row else None
         finally:
             conn.close()
+
+    def get_session_with_messages(self, session_id: str, limit: int = 50) -> dict | None:
+        session = self.get_session(session_id)
+        if not session:
+            return None
+        session["messages"] = self.get_messages(session_id, limit=limit)
+        return session
 
     def list_sessions(self, user_id: str) -> list[dict]:
         conn = self._connect()
@@ -78,17 +126,54 @@ class ChatSessionStore:
                 cur.execute(
                     """
                     SELECT s.session_id, s.user_id, s.title, s.status, s.created_at, s.updated_at,
-                           COALESCE(COUNT(m.id), 0) AS message_count,
-                           MAX(m.created_at) AS last_message_at
+                           COALESCE(s.message_count, 0) AS message_count,
+                           s.last_message_at
                     FROM chat_sessions s
-                    LEFT JOIN chat_messages m ON m.session_id = s.session_id
                     WHERE s.user_id = %s
-                    GROUP BY s.session_id
-                    ORDER BY COALESCE(MAX(m.created_at), s.updated_at) DESC
+                    ORDER BY COALESCE(s.last_message_at, s.updated_at) DESC
                     """,
                     (user_id,),
                 )
-                return [dict(row) for row in cur.fetchall()]
+                return [self._row_to_session(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def update_session(self, session_id: str, *, title: str | None = None, status: str | None = None) -> dict | None:
+        if title is None and status is None:
+            return self.get_session(session_id)
+
+        fields = []
+        values: list[object] = []
+        if title is not None:
+            fields.append("title = %s")
+            values.append(title)
+        if status is not None:
+            fields.append("status = %s")
+            values.append(status)
+
+        now = self._now()
+        fields.extend(["updated_at = %s"])
+        values.append(now)
+        values.append(session_id)
+
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE chat_sessions SET {', '.join(fields)} WHERE session_id = %s",
+                    tuple(values),
+                )
+            conn.commit()
+            return self.get_session(session_id)
+        finally:
+            conn.close()
+
+    def delete_session(self, session_id: str) -> None:
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM chat_sessions WHERE session_id = %s", (session_id,))
+            conn.commit()
         finally:
             conn.close()
 
@@ -106,7 +191,13 @@ class ChatSessionStore:
                      json.dumps(data, ensure_ascii=False, default=str) if data else None, now),
                 )
                 cur.execute(
-                    "UPDATE chat_sessions SET updated_at = %s, last_message_at = %s WHERE session_id = %s",
+                    """
+                    UPDATE chat_sessions
+                    SET updated_at = %s,
+                        last_message_at = %s,
+                        message_count = COALESCE(message_count, 0) + 1
+                    WHERE session_id = %s
+                    """,
                     (now, now, session_id),
                 )
             conn.commit()
