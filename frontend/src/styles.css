@@ -138,6 +138,15 @@ button {
   opacity: 0.5;
 }
 
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+
 .session-list {
   display: flex;
   flex-direction: column;
@@ -158,9 +167,21 @@ button {
   cursor: pointer;
 }
 
+.session-row:disabled {
+  cursor: progress;
+}
+
 .session-row.active {
   border-color: var(--accent);
   background: var(--surface-soft);
+}
+
+.session-row.skeleton {
+  cursor: default;
+  pointer-events: none;
+  background: linear-gradient(90deg, #1f231c 0%, #252a22 50%, #1f231c 100%);
+  background-size: 240% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
 }
 
 .session-title {
@@ -241,9 +262,27 @@ button {
   background: var(--assistant);
 }
 
+.message.pending {
+  border-style: dashed;
+  opacity: 0.9;
+}
+
+.message-status {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
 .message-text {
   word-break: break-word;
   white-space: normal;
+}
+
+.pending-text {
+  color: var(--muted);
 }
 
 .message-text :first-child {
@@ -357,9 +396,52 @@ button {
   color: var(--muted);
 }
 
+.loading-state {
+  text-align: center;
+}
+
+.loading-state p {
+  margin: 0;
+}
+
+.skeleton-line {
+  display: block;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.skeleton-title {
+  width: 60%;
+  height: 14px;
+}
+
+.skeleton-subtitle {
+  width: 48%;
+  height: 10px;
+}
+
+.skeleton-subtitle.short {
+  width: 32%;
+}
+
 .empty-state h3 {
   margin: 0;
   color: var(--text);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
 }
 
 @media (max-width: 860px) {

@@ -43,7 +43,46 @@ function IconButton({ title, onClick, children, kind = "ghost", disabled = false
   );
 }
 
-function Sidebar({ userId, setUserId, sessions, activeId, onRefresh, onCreate, onOpen }) {
+function Spinner() {
+  return e("span", { class: "spinner", "aria-hidden": "true" });
+}
+
+function SessionSkeletonRow() {
+  return e(
+    "div",
+    { class: "session-row skeleton", "aria-hidden": "true" },
+    e("span", { class: "skeleton-line skeleton-title" }),
+    e("span", { class: "skeleton-line skeleton-subtitle" }),
+    e("span", { class: "skeleton-line skeleton-subtitle short" }),
+  );
+}
+
+function mergeSession(list, session) {
+  const filtered = list.filter((item) => item.session_id !== session.session_id);
+  return [session, ...filtered];
+}
+
+function removeSession(list, sessionId) {
+  return list.filter((item) => item.session_id !== sessionId);
+}
+
+function syncSession(list, session) {
+  if (!session) return list;
+  return list.map((item) => (item.session_id === session.session_id ? { ...item, ...session } : item));
+}
+
+function Sidebar({
+  userId,
+  setUserId,
+  sessions,
+  activeId,
+  onRefresh,
+  onCreate,
+  onOpen,
+  loading = false,
+  creating = false,
+  disabled = false,
+}) {
   return e(
     "aside",
     { class: "sidebar" },
@@ -61,31 +100,48 @@ function Sidebar({ userId, setUserId, sessions, activeId, onRefresh, onCreate, o
     e(
       "div",
       { class: "toolbar" },
-      e(IconButton, { title: "New session", kind: "primary", onClick: onCreate }, e(MessageSquarePlus, { size: 18 })),
-      e(IconButton, { title: "Refresh sessions", onClick: onRefresh }, e(RefreshCw, { size: 18 })),
+      e(
+        IconButton,
+        { title: "New session", kind: "primary", onClick: onCreate, disabled: loading || creating || disabled },
+        creating ? e(Spinner) : e(MessageSquarePlus, { size: 18 }),
+      ),
+      e(
+        IconButton,
+        { title: "Refresh sessions", onClick: onRefresh, disabled: loading || creating || disabled },
+        loading ? e(Spinner) : e(RefreshCw, { size: 18 }),
+      ),
     ),
-    e("div", { class: "sidebar-count" }, `${sessions.length} session${sessions.length === 1 ? "" : "s"}`),
+    e(
+      "div",
+      { class: "sidebar-count" },
+      loading && sessions.length === 0
+        ? "Loading sessions..."
+        : `${sessions.length} session${sessions.length === 1 ? "" : "s"}`,
+    ),
     e(
       "div",
       { class: "session-list" },
-      sessions.map((session) =>
-        e(
-          "button",
-          {
-            key: session.session_id,
-            class: `session-row ${session.session_id === activeId ? "active" : ""}`,
-            onClick: () => onOpen(session.session_id),
-          },
-          e("span", { class: "session-title" }, previewTitle(session)),
-          e("span", { class: "session-subtitle" }, `${session.message_count || 0} messages`),
-          e("span", { class: "session-subtitle" }, formatDate(session.updated_at)),
-        ),
-      ),
+      loading && sessions.length === 0
+        ? Array.from({ length: 4 }, (_, index) => e(SessionSkeletonRow, { key: index }))
+        : sessions.map((session) =>
+            e(
+              "button",
+              {
+                key: session.session_id,
+                class: `session-row ${session.session_id === activeId ? "active" : ""}`,
+                onClick: () => onOpen(session.session_id),
+                disabled: loading || disabled,
+              },
+              e("span", { class: "session-title" }, previewTitle(session)),
+              e("span", { class: "session-subtitle" }, `${session.message_count || 0} messages`),
+              e("span", { class: "session-subtitle" }, formatDate(session.updated_at)),
+            ),
+          ),
     ),
   );
 }
 
-function Topbar({ session, title, setTitle, onRename, onDelete }) {
+function Topbar({ session, title, setTitle, onRename, onDelete, loading = false, saving = false }) {
   return e(
     "header",
     { class: "topbar" },
@@ -108,11 +164,23 @@ function Topbar({ session, title, setTitle, onRename, onDelete }) {
         value: title,
         onInput: (event) => setTitle(event.currentTarget.value),
         placeholder: "Session title",
-        disabled: !session,
+        disabled: !session || loading || saving,
       }),
-      e(IconButton, { title: "Save title", onClick: () => onRename(), disabled: !session }, e(Check, { size: 18 })),
-      e(IconButton, { title: "Archive session", onClick: () => onRename("archived"), disabled: !session }, e(Archive, { size: 18 })),
-      e(IconButton, { title: "Delete session", kind: "danger", onClick: onDelete, disabled: !session }, e(Trash2, { size: 18 })),
+      e(
+        IconButton,
+        { title: "Save title", onClick: () => onRename(), disabled: !session || loading || saving },
+        saving ? e(Spinner) : e(Check, { size: 18 }),
+      ),
+      e(
+        IconButton,
+        { title: "Archive session", onClick: () => onRename("archived"), disabled: !session || loading || saving },
+        saving ? e(Spinner) : e(Archive, { size: 18 }),
+      ),
+      e(
+        IconButton,
+        { title: "Delete session", kind: "danger", onClick: onDelete, disabled: !session || loading || saving },
+        saving ? e(Spinner) : e(Trash2, { size: 18 }),
+      ),
     ),
   );
 }
@@ -122,22 +190,25 @@ function MessageBubble({ message }) {
   const payload = message.data ? JSON.stringify(message.data, null, 2) : null;
   return e(
     "article",
-    { class: `message ${isUser ? "user" : "assistant"}` },
+    { class: `message ${isUser ? "user" : "assistant"} ${message.pending ? "pending" : ""}` },
     e(
       "div",
       { class: "message-meta" },
       e("span", null, isUser ? "You" : "TrustFlow"),
+      message.pending ? e("span", { class: "message-status" }, "Loading...") : null,
       e("span", null, formatDate(message.created_at)),
     ),
-    e("div", {
-      class: "message-text",
-      dangerouslySetInnerHTML: { __html: renderMarkdown(message.message) },
-    }),
+    message.pending
+      ? e("div", { class: "message-text pending-text" }, message.message)
+      : e("div", {
+          class: "message-text",
+          dangerouslySetInnerHTML: { __html: renderMarkdown(message.message) },
+        }),
     payload ? e("details", null, e("summary", null, "Response data"), e("pre", null, payload)) : null,
   );
 }
 
-function MessageList({ messages, activeSessionId }) {
+function MessageList({ messages, activeSessionId, loading = false }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
@@ -148,13 +219,21 @@ function MessageList({ messages, activeSessionId }) {
     { class: "messages", ref },
     !activeSessionId
       ? e("div", { class: "empty-state" }, e(Bot, { size: 34 }), e("h3", null, "No session selected"))
+      : loading && messages.length === 0
+        ? e(
+            "div",
+            { class: "empty-state loading-state" },
+            e(Spinner),
+            e("h3", null, "Loading conversation"),
+            e("p", null, "Fetching the latest messages."),
+          )
       : messages.length === 0
         ? e("div", { class: "empty-state" }, e(Bot, { size: 34 }), e("h3", null, "Start the conversation"))
         : messages.map((message) => e(MessageBubble, { key: message.id || `${message.role}-${message.created_at}`, message })),
   );
 }
 
-function Composer({ disabled, onSend }) {
+function Composer({ disabled, onSend, loading = false }) {
   const [value, setValue] = useState("");
 
   async function submit() {
@@ -179,7 +258,11 @@ function Composer({ disabled, onSend }) {
         }
       },
     }),
-    e(IconButton, { title: "Send", kind: "primary", disabled, onClick: submit }, e(Send, { size: 18 })),
+    e(
+      IconButton,
+      { title: "Send", kind: "primary", disabled, onClick: submit },
+      loading ? e(Spinner) : e(Send, { size: 18 }),
+    ),
   );
 }
 
@@ -190,91 +273,267 @@ function App() {
   const [activeSession, setActiveSession] = useState(null);
   const [messages, setMessages] = useState([]);
   const [title, setTitle] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [isLoadingSessions, setIsLoadingSessions] = useState(true);
+  const [isSessionLoading, setIsSessionLoading] = useState(false);
+  const [busyAction, setBusyAction] = useState(null);
   const [error, setError] = useState("");
+  const listRequestIdRef = useRef(0);
+  const sessionRequestIdRef = useRef(0);
+  const sendRequestIdRef = useRef(0);
 
-  const canSend = useMemo(() => Boolean(activeSessionId && !busy), [activeSessionId, busy]);
+  const canSend = useMemo(() => Boolean(activeSessionId && !busyAction && !isSessionLoading), [activeSessionId, busyAction, isSessionLoading]);
 
-  async function refreshSessions() {
-    if (!userId.trim()) return;
+  function syncActiveSession(nextSession) {
+    setActiveSession((current) => (current ? { ...current, ...nextSession } : nextSession));
+    setTitle(nextSession?.title || "");
+    setSessions((current) => syncSession(current, nextSession));
+  }
+
+  function appendPendingMessages(messageText, requestId) {
+    const now = new Date().toISOString();
+    const userTempId = `pending-user-${requestId}`;
+    const assistantTempId = `pending-assistant-${requestId}`;
+    setMessages((current) => [
+      ...current,
+      {
+        id: userTempId,
+        role: "user",
+        message: messageText,
+        created_at: now,
+        pending: true,
+      },
+      {
+        id: assistantTempId,
+        role: "assistant",
+        message: "TrustFlow is generating a reply...",
+        created_at: now,
+        pending: true,
+      },
+    ]);
+    return { userTempId, assistantTempId };
+  }
+
+  function settlePendingMessages({ userTempId, assistantTempId, response, messageText }) {
+    const now = new Date().toISOString();
+    const assistantMessage = {
+      id: `assistant-${assistantTempId}`,
+      role: "assistant",
+      message: response?.message || "No response returned.",
+      data: response,
+      created_at: now,
+    };
+    setMessages((current) =>
+      current
+        .map((item) => {
+          if (item.id === userTempId) {
+            return {
+              ...item,
+              pending: false,
+              message: messageText,
+              created_at: item.created_at || now,
+            };
+          }
+          if (item.id === assistantTempId) {
+            return assistantMessage;
+          }
+          return item;
+        })
+        .filter((item) => item.id !== userTempId || item.message || item.pending)
+        .filter((item) => item.id !== assistantTempId || item.message),
+    );
+  }
+
+  function clearPendingMessages(userTempId, assistantTempId) {
+    setMessages((current) => current.filter((item) => item.id !== userTempId && item.id !== assistantTempId));
+  }
+
+  async function refreshSessions({ silent = false } = {}) {
+    const currentUserId = userId.trim();
+    if (!currentUserId) {
+      setSessions([]);
+      setActiveSessionId(null);
+      setActiveSession(null);
+      setMessages([]);
+      setTitle("");
+      setIsLoadingSessions(false);
+      return [];
+    }
+
+    const requestId = ++listRequestIdRef.current;
+    if (!silent) {
+      setIsLoadingSessions(true);
+    }
     setError("");
-    const data = await listSessions(userId.trim());
-    setSessions(data);
+    try {
+      const data = await listSessions(currentUserId);
+      if (requestId !== listRequestIdRef.current) return data;
+      setSessions(data);
+      if (activeSessionId) {
+        const matched = data.find((session) => session.session_id === activeSessionId);
+        if (matched) {
+          setActiveSession((current) => (current ? { ...current, ...matched } : matched));
+          if (!title.trim()) setTitle(matched.title || "");
+        }
+      }
+      return data;
+    } finally {
+      if (requestId === listRequestIdRef.current && !silent) {
+        setIsLoadingSessions(false);
+      }
+    }
   }
 
   async function openSession(sessionId) {
+    const requestId = ++sessionRequestIdRef.current;
+    const preview = sessions.find((session) => session.session_id === sessionId) || null;
+    setActiveSessionId(sessionId);
+    setActiveSession(preview ? { ...preview } : { session_id: sessionId });
+    setMessages([]);
+    setTitle(preview?.title || "");
+    setIsSessionLoading(true);
     setError("");
-    const detail = await getSession(sessionId);
-    setActiveSessionId(detail.session_id);
-    setActiveSession(detail);
-    setMessages(detail.messages || []);
-    setTitle(detail.title || "");
+    try {
+      const detail = await getSession(sessionId);
+      if (requestId !== sessionRequestIdRef.current) return;
+      setActiveSession(detail);
+      setMessages(detail.messages || []);
+      setTitle(detail.title || "");
+      setSessions((current) => syncSession(current, detail));
+    } finally {
+      if (requestId === sessionRequestIdRef.current) {
+        setIsSessionLoading(false);
+      }
+    }
   }
 
   async function handleCreate() {
-    setBusy(true);
+    setBusyAction("create");
     try {
+      listRequestIdRef.current += 1;
       const session = await createSession(userId.trim(), title.trim() || null);
-      await refreshSessions();
-      await openSession(session.session_id);
+      setSessions((current) => mergeSession(current, session));
+      setActiveSessionId(session.session_id);
+      setActiveSession(session);
+      setMessages([]);
+      setTitle(session.title || "");
+      setError("");
     } catch (err) {
       setError(err.message);
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   }
 
   async function handleRename(status) {
     if (!activeSessionId) return;
-    setBusy(true);
+    setBusyAction("save");
     try {
+      listRequestIdRef.current += 1;
       const payload = { title: title.trim() || activeSession?.title || activeSessionId };
       if (status) payload.status = status;
       const session = await updateSession(activeSessionId, payload);
-      setActiveSession(session);
-      await refreshSessions();
-      await openSession(session.session_id);
+      syncActiveSession(session);
     } catch (err) {
       setError(err.message);
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   }
 
   async function handleDelete() {
     if (!activeSessionId || !confirm("Delete this session and all messages?")) return;
-    setBusy(true);
+    setBusyAction("delete");
     try {
+      listRequestIdRef.current += 1;
       await deleteSession(activeSessionId);
+      const deletedId = activeSessionId;
       setActiveSessionId(null);
       setActiveSession(null);
       setMessages([]);
       setTitle("");
-      await refreshSessions();
+      setSessions((current) => removeSession(current, deletedId));
     } catch (err) {
       setError(err.message);
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   }
 
   async function handleSend(message) {
     if (!activeSessionId) return;
-    setBusy(true);
+    const trimmedMessage = message.trim();
+    if (!trimmedMessage) return;
+    const requestId = ++sendRequestIdRef.current;
+    const pendingIds = appendPendingMessages(trimmedMessage, requestId);
+    setBusyAction("send");
+    setError("");
     try {
-      await sendChatMessage({ userId: userId.trim(), sessionId: activeSessionId, message });
-      await refreshSessions();
-      await openSession(activeSessionId);
+      listRequestIdRef.current += 1;
+      const response = await sendChatMessage({ userId: userId.trim(), sessionId: activeSessionId, message: trimmedMessage });
+      if (requestId !== sendRequestIdRef.current) return;
+      settlePendingMessages({ ...pendingIds, response, messageText: trimmedMessage });
+      setActiveSession((current) =>
+        current
+          ? {
+              ...current,
+              updated_at: new Date().toISOString(),
+              last_message_at: new Date().toISOString(),
+              message_count: (current.message_count || 0) + 2,
+            }
+          : current,
+      );
+      setSessions((current) =>
+        current.map((session) =>
+          session.session_id === activeSessionId
+            ? {
+                ...session,
+                updated_at: new Date().toISOString(),
+                last_message_at: new Date().toISOString(),
+                message_count: (session.message_count || 0) + 2,
+              }
+            : session,
+        ),
+      );
+      refreshSessions({ silent: true }).catch((err) => setError(err.message));
     } catch (err) {
+      clearPendingMessages(pendingIds.userTempId, pendingIds.assistantTempId);
       setError(err.message);
     } finally {
-      setBusy(false);
+      if (requestId === sendRequestIdRef.current) {
+        setBusyAction(null);
+      }
     }
   }
 
   useEffect(() => {
-    refreshSessions().catch((err) => setError(err.message));
+    const trimmed = userId.trim();
+    if (!trimmed) {
+      listRequestIdRef.current += 1;
+      sessionRequestIdRef.current += 1;
+      sendRequestIdRef.current += 1;
+      setSessions([]);
+      setActiveSessionId(null);
+      setActiveSession(null);
+      setMessages([]);
+      setTitle("");
+      setIsLoadingSessions(false);
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      refreshSessions().catch((err) => setError(err.message));
+    }, 250);
+
+    return () => window.clearTimeout(timeoutId);
   }, [userId]);
+
+  function handleRefreshClick() {
+    refreshSessions().catch((err) => setError(err.message));
+  }
+
+  function handleOpenSession(sessionId) {
+    openSession(sessionId).catch((err) => setError(err.message));
+  }
 
   return e(
     "main",
@@ -284,9 +543,12 @@ function App() {
       setUserId,
       sessions,
       activeId: activeSessionId,
-      onRefresh: refreshSessions,
+      onRefresh: handleRefreshClick,
       onCreate: handleCreate,
-      onOpen: openSession,
+      onOpen: handleOpenSession,
+      loading: isLoadingSessions,
+      creating: busyAction === "create",
+      disabled: Boolean(busyAction),
     }),
     e(
       "section",
@@ -297,10 +559,12 @@ function App() {
         setTitle,
         onRename: handleRename,
         onDelete: handleDelete,
+        loading: isSessionLoading,
+        saving: busyAction === "save" || busyAction === "delete",
       }),
       error ? e("div", { class: "error-banner" }, error) : null,
-      e(MessageList, { messages, activeSessionId }),
-      e(Composer, { disabled: !canSend, onSend: handleSend }),
+      e(MessageList, { messages, activeSessionId, loading: isSessionLoading }),
+      e(Composer, { disabled: !canSend || busyAction === "send", onSend: handleSend, loading: busyAction === "send" }),
     ),
   );
 }

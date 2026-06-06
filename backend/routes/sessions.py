@@ -28,11 +28,10 @@ class SessionUpdateRequest(BaseModel):
 
 @router.post("/sessions")
 async def create_session(request: SessionCreateRequest):
-    session = chat_session_store.create_session(
+    return chat_session_store.create_session(
         user_id=request.user_id,
         title=request.title,
     )
-    return session
 
 
 @router.get("/sessions")
@@ -42,7 +41,7 @@ async def list_sessions(user_id: str):
 
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str):
-    session = chat_session_store.get_session(session_id)
+    session = chat_session_store.get_session_with_messages(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
@@ -51,3 +50,21 @@ async def get_session(session_id: str):
 @router.get("/sessions/{session_id}/messages")
 async def get_messages(session_id: str, limit: int = 50):
     return chat_session_store.get_messages(session_id, limit=limit)
+
+
+@router.patch("/sessions/{session_id}")
+async def update_session(session_id: str, request: SessionUpdateRequest):
+    session = chat_session_store.update_session(
+        session_id,
+        title=request.title,
+        status=request.status,
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+async def delete_session(session_id: str):
+    chat_session_store.delete_session(session_id)
+    return None
