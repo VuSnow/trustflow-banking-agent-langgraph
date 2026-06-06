@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -84,6 +85,13 @@ async def run_finance_agent(
         else:
             raw_content = "Xin lỗi, không thể phân tích tài chính lúc này."
 
+        if _needs_response_repair(message, raw_content):
+            raw_content = await _repair_incomplete_response(
+                question=message,
+                draft_response=raw_content,
+                result=result,
+            )
+
         # Save key insights to memory for follow-up questions
         _save_memory_from_response(user_id, session_id, message, raw_content, result)
 
@@ -100,6 +108,104 @@ async def run_finance_agent(
             "message": "Xin lỗi, tôi không thể phân tích chi tiêu lúc này. Vui lòng thử lại.",
             "data": {"error": str(e)},
         }
+
+
+def _needs_response_repair(question: str, response: str) -> bool:
+    """Detect incomplete/dangling finance answers that should be rewritten."""
+    q = (question or "").lower()
+    r = (response or "").lower()
+
+    dangling_markers = [
+        "tôi sẽ tiếp tục truy vấn",
+        "sẽ tiếp tục truy vấn",
+        "tôi sẽ cần",
+        "cần thêm dữ liệu",
+        "đang truy vấn",
+        "đợi tôi",
+    ]
+    if any(marker in r for marker in dangling_markers):
+        return True
+
+    # Comparison questions should include a concrete increase/decrease conclusion.
+    if "so sánh" in q:
+        has_comparison_outcome = any(
+            token in r for token in ("tăng", "giảm", "cao hơn", "thấp hơn", "chênh lệch")
+        )
+        if not has_comparison_outcome:
+            return True
+
+    return False
+
+
+def _extract_tool_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract compact tool payloads from LangGraph messages for response repair."""
+    payloads: list[dict[str, Any]] = []
+    for msg in result.get("messages", []):
+        if not (hasattr(msg, "type") and msg.type == "tool"):
+            continue
+
+        content = msg.content
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                content = {"raw": content[:1000]}
+
+        payloads.append(
+            {
+                "tool": msg.name if hasattr(msg, "name") else "unknown",
+                "content": _compact_tool_result(content) if isinstance(content, dict) else content,
+            }
+        )
+
+    return payloads[:8]
+
+
+async def _repair_incomplete_response(
+    *, question: str, draft_response: str, result: dict[str, Any]
+) -> str:
+    """Rewrite unfinished responses into a complete final advisory answer."""
+    try:
+        tool_payloads = _extract_tool_payloads(result)
+        tool_payloads_text = json.dumps(tool_payloads, ensure_ascii=False, default=str)
+        if len(tool_payloads_text) > 12000:
+            tool_payloads_text = tool_payloads_text[:12000] + " ...<truncated>"
+
+        reviewer = ChatOpenAI(
+            model=OPENAI_MODEL,
+            api_key=OPENAI_API_KEY,
+            temperature=0.1,
+        )
+
+        review_prompt = [
+            SystemMessage(
+                content=(
+                    "Bạn là lớp kiểm định chất lượng phản hồi tài chính. "
+                    "Hãy tạo câu trả lời CUỐI CÙNG hoàn chỉnh cho người dùng từ dữ liệu tool."
+                    "\nQuy tắc bắt buộc:"
+                    "\n- Trả lời tiếng Việt."
+                    "\n- Không lặp cùng một block số liệu."
+                    "\n- Không để câu dang dở như 'tôi sẽ tiếp tục truy vấn'."
+                    "\n- Nếu là câu hỏi so sánh, phải nêu rõ khoản tăng/giảm và kết luận ngắn."
+                    "\n- Nếu dữ liệu thiếu, nêu thiếu gì và đưa kết luận tạm thời rõ ràng."
+                    "\n- Kết thúc với câu: 'Đây chỉ là tham khảo, không phải tư vấn tài chính chuyên nghiệp.'"
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"Câu hỏi người dùng:\n{question}\n\n"
+                    f"Bản nháp hiện tại:\n{draft_response}\n\n"
+                    f"Kết quả tool:\n{tool_payloads_text}"
+                )
+            ),
+        ]
+        fixed = await reviewer.ainvoke(review_prompt)
+        fixed_content = fixed.content if hasattr(fixed, "content") else str(fixed)
+        fixed_content = (fixed_content or "").strip()
+        return fixed_content or draft_response
+    except Exception as e:
+        logger.warning(f"[FINANCE] Failed to repair incomplete response: {e}")
+        return draft_response
 
 
 def _save_memory_from_response(
