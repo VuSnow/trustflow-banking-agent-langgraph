@@ -141,6 +141,7 @@ class FlowRouter:
             "WAITING_DRAFT_CONFIRMATION",
             "WAITING_BILL_CONFIRMATION",
             "WAITING_TOPUP_CONFIRMATION",
+            "WAITING_CARD_CONFIRMATION",
         ):
             return await self._route_confirmation(msg)
 
@@ -239,7 +240,7 @@ class FlowRouter:
         self, pending: PendingQuestion, msg: str
     ) -> RouteDecision | None:
         """Try to answer a pending question without LLM."""
-        if pending.expected_type == "recipient_choice":
+        if pending.expected_type in ("recipient_choice", "enum"):
             # Expecting a number like "1", "2", "3"
             if re.match(r"^\d+$", msg):
                 idx = int(msg) - 1

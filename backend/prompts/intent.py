@@ -30,7 +30,7 @@ For TRANSACTION:
 - TOP_UP: top up phone, wallet, prepaid account.
 
 For CARD_OPERATION:
-- LOCK_CARD, UNLOCK_CARD, ACTIVATE_CARD, REISSUE_CARD, CHANGE_CARD_LIMIT, VIEW_CARD_INFO.
+- LOCK_CARD, UNLOCK_CARD, REPORT_LOST, ACTIVATE_CARD, REISSUE_CARD, CHANGE_CARD_LIMIT, VIEW_CARD_INFO.
 
 For ACCOUNT_OPERATION:
 - OPEN_ACCOUNT, CLOSE_ACCOUNT, UPDATE_ACCOUNT_INFO, MANAGE_BENEFICIARY, VIEW_ACCOUNT_INFO.
@@ -43,9 +43,10 @@ For QA and DATA_QUERY:
 
 Routing rules:
 - If the user wants to transfer, send, pay, or top up money → TRANSACTION.
-- If the user wants to lock, unlock, activate, replace, or change card settings → CARD_OPERATION.
+- If the user wants to lock, unlock, report lost (báo mất), activate, replace, or change card settings → CARD_OPERATION.
 - If the user wants to open, close, update, or manage an account/beneficiary → ACCOUNT_OPERATION.
 - If the user wants to report fraud, scam, or a suspicious transaction → FRAUD_REPORT.
+- EXCEPTION: "báo mất thẻ" (report lost card) is CARD_OPERATION (not FRAUD_REPORT). Only classify as FRAUD_REPORT when the user reports fraud, scam, or phishing.
 - If the user wants help understanding spending habits, budgeting, savings → FINANCE_ADVICE.
 - If the user asks to check, view, search, summarize banking data → DATA_QUERY.
 - If the user asks about rules, policies, fees, products → QA.

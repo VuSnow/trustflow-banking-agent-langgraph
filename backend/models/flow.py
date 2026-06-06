@@ -63,6 +63,28 @@ class TopUpDraft(BaseModel):
     amount: int | None = None
 
 
+# ─── CardDraft ────────────────────────────────────────────────────────────────
+
+
+class CardDraft(BaseModel):
+    """Card operation draft — stores target card and intended operation."""
+
+    operation: Literal[
+        "LOCK_CARD", "UNLOCK_CARD", "REPORT_LOST", "VIEW_CARD_INFO"
+    ] | None = None
+    card_id: str | None = None
+    masked_card_no: str | None = None
+    card_type: str | None = None  # DEBIT / CREDIT
+    card_network: str | None = None  # VISA / MASTERCARD / NAPAS
+    card_status: str | None = None  # ACTIVE / TEMP_LOCKED / LOST
+    # Hints from user (before resolution)
+    card_hint_last4: str | None = None
+    card_hint_type: str | None = None
+    card_hint_network: str | None = None
+    # Multiple card candidates (for disambiguation)
+    candidates: list[dict] | None = None
+
+
 # ─── CategoryPrediction ───────────────────────────────────────────────────────
 
 
@@ -157,7 +179,7 @@ class FlowState(BaseModel):
     """
 
     flow_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    flow_type: Literal["TRANSACTION", "BILL_PAYMENT", "TOP_UP"]
+    flow_type: Literal["TRANSACTION", "BILL_PAYMENT", "TOP_UP", "CARD_OPERATION"]
 
     status: Literal[
         "COLLECTING",
@@ -166,6 +188,7 @@ class FlowState(BaseModel):
         "WAITING_TOPUP_CONFIRMATION",
         "WAITING_RECIPIENT_CONFIRMATION",
         "WAITING_DRAFT_CONFIRMATION",
+        "WAITING_CARD_CONFIRMATION",
         "WAITING_OTP",
         "WAITING_CATEGORY_CONFIRMATION",
         "EXECUTING",
@@ -176,6 +199,7 @@ class FlowState(BaseModel):
     draft: TransactionDraft | None = None
     bill_draft: BillDraft | None = None
     topup_draft: TopUpDraft | None = None
+    card_draft: CardDraft | None = None
     category_prediction: CategoryPrediction | None = None
     pending_question: PendingQuestion | None = None
     interrupted_intent: InterruptedIntent | None = None
@@ -201,6 +225,7 @@ class FlowState(BaseModel):
             "WAITING_DRAFT_CONFIRMATION",
             "WAITING_BILL_CONFIRMATION",
             "WAITING_TOPUP_CONFIRMATION",
+            "WAITING_CARD_CONFIRMATION",
         ):
             return "limited"
         # WAITING_CATEGORY_CONFIRMATION is flexible — user can freely switch intent
