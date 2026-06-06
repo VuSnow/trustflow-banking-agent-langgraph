@@ -29,6 +29,7 @@ from backend.models.flow import (
     TransactionDraft,
     BillDraft,
     TopUpDraft,
+    CardDraft,
     CategoryPrediction,
     PendingQuestion,
     InterruptedIntent,
@@ -50,6 +51,7 @@ from backend.services.langfuse_trace import get_trace_config
 from backend.agents.transaction import TransactionExtractor
 from backend.agents.bill_payment import BillPaymentExtractor
 from backend.agents.topup import TopUpExtractor
+from backend.agents.card_operation import CardOperationExtractor
 from backend.services.category_classifier import CategoryClassifier
 from backend.prompts.intent import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
 
@@ -63,6 +65,7 @@ _extractor = TransactionExtractor()
 _bill_extractor = BillPaymentExtractor()
 _bill_resolver = BillResolver()
 _topup_extractor = TopUpExtractor()
+_card_extractor = CardOperationExtractor()
 _category_classifier = CategoryClassifier()
 _flow_router = FlowRouter()
 
@@ -246,6 +249,42 @@ TEMPLATES = {
     ),
     "category_confirmed": "✅ Đã phân loại: **{category_name}**",
     "category_saved_default": "📂 Đã lưu phân loại: **{category_name}**",
+    # ─── Card Operation Templates ───
+    "card_list": (
+        "Bạn có {count} thẻ:\n\n"
+        "{card_list}\n\n"
+        "Bạn muốn thao tác với thẻ nào? (Nhập số thứ tự)"
+    ),
+    "card_info": (
+        "Thông tin thẻ:\n\n"
+        "• Số thẻ: {masked_card_no}\n"
+        "• Loại: {card_type}\n"
+        "• Mạng: {card_network}\n"
+        "• Trạng thái: {status}\n"
+        "• Tài khoản liên kết: {account_no}"
+    ),
+    "card_lock_confirm": (
+        "Xác nhận khóa tạm thời thẻ {masked_card_no} ({card_type} {card_network})?\n\n"
+        "⚠️ Thẻ sẽ không thể sử dụng cho đến khi bạn mở khóa."
+    ),
+    "card_unlock_confirm": (
+        "Xác nhận mở khóa thẻ {masked_card_no} ({card_type} {card_network})?"
+    ),
+    "card_report_lost_confirm": (
+        "⚠️ **CẢNH BÁO**: Báo mất thẻ {masked_card_no} ({card_type} {card_network})?\n\n"
+        "Hành động này là **VĨNH VIỄN** — thẻ sẽ bị vô hiệu hóa và không thể mở khóa lại.\n"
+        "Bạn có chắc chắn không?"
+    ),
+    "card_lock_success": "✅ Đã khóa tạm thời thẻ {masked_card_no}.",
+    "card_unlock_success": "✅ Đã mở khóa thẻ {masked_card_no}.",
+    "card_report_lost_success": "✅ Đã báo mất thẻ {masked_card_no}. Thẻ đã bị vô hiệu hóa vĩnh viễn.",
+    "card_unlock_otp_request": (
+        "Tôi đã gửi mã OTP đến số điện thoại đăng ký của bạn.\n"
+        "Vui lòng nhập OTP để mở khóa thẻ {masked_card_no}."
+    ),
+    "card_not_found": "Không tìm thấy thẻ phù hợp. Vui lòng kiểm tra lại.",
+    "card_invalid_status": "Thẻ đang ở trạng thái {status}, không thể {action}.",
+    "card_need_operation": "Bạn muốn làm gì với thẻ? (Khóa thẻ / Mở khóa / Báo mất / Xem thông tin)",
 }
 
 
@@ -428,10 +467,44 @@ async def dispatch_agent_node(state: ChatState) -> dict:
                     }
                 },
             }
+        elif intent == "CARD_OPERATION":
+            # Card operation flow — use card extractor
+            cards_context = _get_user_cards_context(state["user_id"])
+            card_result = await _card_extractor.process(
+                message=last_message,
+                user_id=state["user_id"],
+                cards_context=cards_context,
+                session_id=state["session_id"],
+            )
+
+            new_flow = FlowState(
+                flow_type="CARD_OPERATION",
+                status="COLLECTING",
+                card_draft=CardDraft(
+                    operation=card_result.operation,
+                    card_hint_last4=card_result.card_hint_last4,
+                    card_hint_type=card_result.card_hint_type,
+                    card_hint_network=card_result.card_hint_network,
+                ),
+            )
+
+            return {
+                "active_flow": serialize_flow(new_flow),
+                "response_data": {
+                    "agent_result": {
+                        "operation": card_result.operation,
+                        "card_hint_last4": card_result.card_hint_last4,
+                        "card_hint_type": card_result.card_hint_type,
+                        "card_hint_network": card_result.card_hint_network,
+                        "interpretation": card_result.interpretation,
+                    }
+                },
+            }
+
         else:
             # Non-transaction intent
             result = {
-                "response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, và nạp tiền.",
+                "response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, nạp tiền, và quản lý thẻ.",
                 "response_data": {"handled": True},
             }
             if _category_was_cleared:
@@ -442,6 +515,39 @@ async def dispatch_agent_node(state: ChatState) -> dict:
         # Category confirmation — no LLM needed, handle in handle_flow_action
         if flow and flow.status == "WAITING_CATEGORY_CONFIRMATION":
             return {}
+
+        # For card operation flows, re-extract with context
+        if flow and flow.flow_type == "CARD_OPERATION":
+            # If answering a pending question (e.g. picking card by number), skip LLM
+            if action == "ANSWER_PENDING_QUESTION":
+                return {}
+            cards_context = _get_user_cards_context(state["user_id"])
+            card_result = await _card_extractor.process(
+                message=last_message,
+                user_id=state["user_id"],
+                cards_context=cards_context,
+                session_id=state["session_id"],
+            )
+            if flow.card_draft is None:
+                flow.card_draft = CardDraft()
+            if card_result.operation:
+                flow.card_draft.operation = card_result.operation
+            if card_result.card_hint_last4:
+                flow.card_draft.card_hint_last4 = card_result.card_hint_last4
+            if card_result.card_hint_type:
+                flow.card_draft.card_hint_type = card_result.card_hint_type
+            if card_result.card_hint_network:
+                flow.card_draft.card_hint_network = card_result.card_hint_network
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_data": {
+                    "agent_result": {
+                        "operation": card_result.operation,
+                        "card_hint_last4": card_result.card_hint_last4,
+                        "interpretation": card_result.interpretation,
+                    }
+                },
+            }
 
         # For bill payment flows, no LLM needed — orchestrator handles directly
         if flow and flow.flow_type == "BILL_PAYMENT":
@@ -605,7 +711,21 @@ async def handle_flow_action_node(state: ChatState) -> dict:
     # ─── CLASSIFY_NEW_INTENT / CONTINUE_COLLECTING / MODIFY_DRAFT ─────
     if action in ("CLASSIFY_NEW_INTENT", "CONTINUE_COLLECTING", "MODIFY_DRAFT", "ANSWER_PENDING_QUESTION"):
         if not flow:
-            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, hoặc nạp tiền."}
+            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, nạp tiền, và quản lý thẻ."}
+
+        # ── Card Operation Flow ──
+        if flow.flow_type == "CARD_OPERATION":
+            flow, message = _handle_card_collecting(flow, user_id, response_data, action, decision_data)
+            flow.updated_at = datetime.now()
+            if flow.status == "COMPLETED":
+                return {
+                    "active_flow": None,
+                    "response_message": message,
+                }
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_message": message,
+            }
 
         # ── Bill Payment Flow ──
         if flow.flow_type == "BILL_PAYMENT":
@@ -750,6 +870,54 @@ async def handle_flow_action_node(state: ChatState) -> dict:
                 "response_message": message,
             }
 
+        # ── Card: WAITING_CARD_CONFIRMATION → Execute or OTP ──
+        if flow.status == "WAITING_CARD_CONFIRMATION" and flow.flow_type == "CARD_OPERATION":
+            card_draft = flow.card_draft
+            if not card_draft or not card_draft.card_id or not card_draft.operation:
+                return {"response_message": "Thông tin thẻ không đầy đủ."}
+
+            if card_draft.operation == "UNLOCK_CARD":
+                # Unlock needs OTP
+                summary_hash = hashlib.sha256(
+                    f"{card_draft.card_id}:{card_draft.operation}".encode()
+                ).hexdigest()[:32]
+                challenge_id = otp_service.create_challenge(
+                    flow_id=flow.flow_id,
+                    user_id=user_id,
+                    summary_hash=summary_hash,
+                )
+                flow.otp_challenge_id = challenge_id
+                flow.status = "WAITING_OTP"
+                flow.pending_question = PendingQuestion(
+                    slot="otp",
+                    question="Nhập mã OTP",
+                    expected_type="otp",
+                )
+                flow.updated_at = datetime.now()
+                message = TEMPLATES["card_unlock_otp_request"].format(
+                    masked_card_no=card_draft.masked_card_no or "?",
+                )
+                write_audit_log(
+                    cif_no=user_id,
+                    event_type="CARD_OTP_CHALLENGE_CREATED",
+                    actor="system",
+                    session_id=session_id,
+                    event_payload={"challenge_id": challenge_id, "operation": "UNLOCK_CARD"},
+                )
+                return {
+                    "active_flow": serialize_flow(flow),
+                    "response_message": message,
+                }
+            else:
+                # LOCK_CARD and REPORT_LOST don't need OTP — execute directly
+                exec_result = _execute_card_operation(card_draft, user_id, session_id)
+                flow.status = "COMPLETED"
+                flow.updated_at = datetime.now()
+                return {
+                    "active_flow": None,
+                    "response_message": exec_result["message"],
+                }
+
         if flow.status == "WAITING_RECIPIENT_CONFIRMATION":
             flow = await _handle_recipient_confirmed(flow, user_id)
             if flow.status == "CANCELLED":
@@ -830,6 +998,11 @@ async def handle_flow_action_node(state: ChatState) -> dict:
             current_hash = hashlib.sha256(
                 f"{td.topup_target}:{td.amount}:{td.topup_provider}".encode()
             ).hexdigest()[:32]
+        elif flow.flow_type == "CARD_OPERATION" and flow.card_draft:
+            cd = flow.card_draft
+            current_hash = hashlib.sha256(
+                f"{cd.card_id}:{cd.operation}".encode()
+            ).hexdigest()[:32]
         else:
             current_hash = flow.draft.summary_hash()
 
@@ -869,6 +1042,15 @@ async def handle_flow_action_node(state: ChatState) -> dict:
                     "active_flow": None,
                     "response_message": exec_result["message"],
                     "response_data": exec_result.get("data", {}),
+                }
+            elif flow.flow_type == "CARD_OPERATION":
+                # Execute card unlock after OTP
+                exec_result = _execute_card_operation(flow.card_draft, user_id, session_id)
+                flow.status = "COMPLETED"
+                flow.updated_at = datetime.now()
+                return {
+                    "active_flow": None,
+                    "response_message": exec_result["message"],
                 }
             else:
                 # Execute transaction
@@ -1010,6 +1192,9 @@ async def handle_flow_action_node(state: ChatState) -> dict:
             elif flow.flow_type == "TOP_UP" and flow.topup_draft:
                 amount_str = f"{flow.topup_draft.amount:,.0f} VND" if flow.topup_draft.amount else "?"
                 name_str = flow.topup_draft.topup_target or "nạp tiền"
+            elif flow.flow_type == "CARD_OPERATION" and flow.card_draft:
+                amount_str = flow.card_draft.operation or "thao tác thẻ"
+                name_str = flow.card_draft.masked_card_no or "thẻ"
             else:
                 amount_str = f"{flow.draft.amount:,.0f} VND" if flow.draft and flow.draft.amount else "?"
                 name_str = flow.draft.recipient_name if flow.draft else "?"
@@ -1032,6 +1217,7 @@ async def handle_flow_action_node(state: ChatState) -> dict:
             "WAITING_DRAFT_CONFIRMATION",
             "WAITING_BILL_CONFIRMATION",
             "WAITING_TOPUP_CONFIRMATION",
+            "WAITING_CARD_CONFIRMATION",
         ):
             return {"response_message": TEMPLATES["ask_confirm_or_cancel"]}
         return {"response_message": "Tôi chưa hiểu rõ. Vui lòng thử lại."}
@@ -1993,3 +2179,298 @@ async def _predict_category(flow: FlowState, user_id: str, tx_ref: str) -> dict 
         logger.error(f"[CATEGORY] Prediction failed: {e}")
 
     return None
+
+
+# ─── Card Operation Helpers ───────────────────────────────────────────────────
+
+
+def _get_user_cards_context(user_id: str) -> str:
+    """Get formatted list of user's cards for LLM context."""
+    import psycopg2
+    from backend.config import DATABASE_URL
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT card_id, masked_card_no, card_type, card_network, status
+                    FROM cards WHERE cif_no = %s ORDER BY issued_at DESC
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return "No cards found."
+                lines = []
+                for i, (card_id, masked, ctype, network, status) in enumerate(rows, 1):
+                    lines.append(f"{i}. {masked} | {ctype} | {network} | {status} | id={card_id}")
+                return "\n".join(lines)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"[CARD] get_user_cards_context error: {e}")
+        return "Error loading cards."
+
+
+def _resolve_card(card_draft: CardDraft, user_id: str) -> dict | None:
+    """Resolve card from hints. Returns card dict or None."""
+    import psycopg2
+    import psycopg2.extras
+    from backend.config import DATABASE_URL
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                conditions = ["cif_no = %s"]
+                params = [user_id]
+
+                if card_draft.card_hint_last4:
+                    conditions.append("masked_card_no LIKE %s")
+                    params.append(f"%{card_draft.card_hint_last4}")
+                if card_draft.card_hint_type:
+                    conditions.append("card_type = %s")
+                    params.append(card_draft.card_hint_type.upper())
+                if card_draft.card_hint_network:
+                    conditions.append("card_network = %s")
+                    params.append(card_draft.card_hint_network.upper())
+
+                where = " AND ".join(conditions)
+                cur.execute(
+                    f"SELECT card_id, masked_card_no, card_type, card_network, status, account_no "
+                    f"FROM cards WHERE {where} ORDER BY issued_at DESC",
+                    params,
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+
+                if len(rows) == 1:
+                    rows[0]["card_id"] = str(rows[0]["card_id"])
+                    return rows[0]
+                elif len(rows) > 1:
+                    for r in rows:
+                        r["card_id"] = str(r["card_id"])
+                    return {"multiple": True, "cards": rows}
+                return None
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"[CARD] resolve_card error: {e}")
+        return None
+
+
+def _handle_card_collecting(
+    flow: FlowState,
+    user_id: str,
+    response_data: dict,
+    action: str,
+    decision_data: dict,
+) -> tuple[FlowState, str]:
+    """Handle card operation flow in COLLECTING state.
+
+    Returns (updated_flow, response_message).
+    """
+    card_draft = flow.card_draft
+    if not card_draft:
+        card_draft = CardDraft()
+        flow.card_draft = card_draft
+
+    # Apply extraction results
+    agent_result = response_data.get("agent_result", {})
+    if agent_result:
+        if agent_result.get("operation"):
+            card_draft.operation = agent_result["operation"]
+        if agent_result.get("card_hint_last4"):
+            card_draft.card_hint_last4 = agent_result["card_hint_last4"]
+        if agent_result.get("card_hint_type"):
+            card_draft.card_hint_type = agent_result["card_hint_type"]
+        if agent_result.get("card_hint_network"):
+            card_draft.card_hint_network = agent_result["card_hint_network"]
+
+    # Handle card selection from list
+    if action == "ANSWER_PENDING_QUESTION":
+        choice_data = decision_data.get("data", {}).get("choice")
+        if choice_data and choice_data.get("card_id"):
+            card_draft.card_id = choice_data["card_id"]
+            card_draft.masked_card_no = choice_data.get("masked_card_no")
+            card_draft.card_type = choice_data.get("card_type")
+            card_draft.card_network = choice_data.get("card_network")
+            card_draft.card_status = choice_data.get("status")
+
+    # Step 1: Need operation?
+    if not card_draft.operation:
+        flow.pending_question = PendingQuestion(
+            slot="card_operation",
+            question=TEMPLATES["card_need_operation"],
+            expected_type="text",
+        )
+        return flow, TEMPLATES["card_need_operation"]
+
+    # Step 2: Resolve card
+    if not card_draft.card_id:
+        resolved = _resolve_card(card_draft, user_id)
+        if resolved is None:
+            flow.status = "COMPLETED"
+            return flow, TEMPLATES["card_not_found"]
+        elif resolved.get("multiple"):
+            # Multiple cards — ask user to choose
+            cards = resolved["cards"]
+            card_draft.candidates = cards
+            card_list = "\n".join(
+                f"  {i+1}. {c['masked_card_no']} ({c['card_type']} {c['card_network']}) — {c['status']}"
+                for i, c in enumerate(cards)
+            )
+            flow.pending_question = PendingQuestion(
+                slot="card_choice",
+                question="Chọn thẻ",
+                expected_type="enum",
+                options=[
+                    {"card_id": str(c["card_id"]), "masked_card_no": c["masked_card_no"],
+                     "card_type": c["card_type"], "card_network": c["card_network"],
+                     "status": c["status"]}
+                    for c in cards
+                ],
+            )
+            return flow, TEMPLATES["card_list"].format(
+                count=len(cards),
+                card_list=card_list,
+            )
+        else:
+            # Single card resolved
+            card_draft.card_id = resolved["card_id"]
+            card_draft.masked_card_no = resolved["masked_card_no"]
+            card_draft.card_type = resolved["card_type"]
+            card_draft.card_network = resolved["card_network"]
+            card_draft.card_status = resolved["status"]
+
+    # Step 3: VIEW_CARD_INFO — just return info (no confirmation needed)
+    if card_draft.operation == "VIEW_CARD_INFO":
+        flow.status = "COMPLETED"
+        return flow, TEMPLATES["card_info"].format(
+            masked_card_no=card_draft.masked_card_no or "?",
+            card_type=card_draft.card_type or "?",
+            card_network=card_draft.card_network or "?",
+            status=card_draft.card_status or "?",
+            account_no=_get_card_account_no(card_draft.card_id) or "?",
+        )
+
+    # Step 4: Validate card status for operation
+    status_valid, error_msg = _validate_card_status(card_draft)
+    if not status_valid:
+        flow.status = "COMPLETED"
+        return flow, error_msg
+
+    # Step 5: Ask confirmation
+    if card_draft.operation == "LOCK_CARD":
+        message = TEMPLATES["card_lock_confirm"].format(
+            masked_card_no=card_draft.masked_card_no or "?",
+            card_type=card_draft.card_type or "",
+            card_network=card_draft.card_network or "",
+        )
+    elif card_draft.operation == "UNLOCK_CARD":
+        message = TEMPLATES["card_unlock_confirm"].format(
+            masked_card_no=card_draft.masked_card_no or "?",
+            card_type=card_draft.card_type or "",
+            card_network=card_draft.card_network or "",
+        )
+    elif card_draft.operation == "REPORT_LOST":
+        message = TEMPLATES["card_report_lost_confirm"].format(
+            masked_card_no=card_draft.masked_card_no or "?",
+            card_type=card_draft.card_type or "",
+            card_network=card_draft.card_network or "",
+        )
+    else:
+        message = "Xác nhận thao tác?"
+
+    flow.status = "WAITING_CARD_CONFIRMATION"
+    flow.pending_question = None
+    return flow, message
+
+
+def _validate_card_status(card_draft: CardDraft) -> tuple[bool, str]:
+    """Validate card status is compatible with operation."""
+    status = card_draft.card_status
+    op = card_draft.operation
+
+    if op == "LOCK_CARD" and status != "ACTIVE":
+        return False, TEMPLATES["card_invalid_status"].format(status=status, action="khóa")
+    if op == "UNLOCK_CARD" and status != "TEMP_LOCKED":
+        return False, TEMPLATES["card_invalid_status"].format(status=status, action="mở khóa")
+    if op == "REPORT_LOST" and status in ("LOST", "CANCELLED"):
+        return False, TEMPLATES["card_invalid_status"].format(status=status, action="báo mất")
+
+    return True, ""
+
+
+def _get_card_account_no(card_id: str) -> str | None:
+    """Get account_no linked to a card."""
+    import psycopg2
+    from backend.config import DATABASE_URL
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT account_no FROM cards WHERE card_id = %s::uuid", (card_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _execute_card_operation(card_draft: CardDraft, user_id: str, session_id: str) -> dict:
+    """Execute card operation (lock/unlock/report_lost)."""
+    from backend.tools.card_tools import lock_card, unlock_card, report_lost_card
+
+    card_id = card_draft.card_id
+    operation = card_draft.operation
+
+    if operation == "LOCK_CARD":
+        result = lock_card.invoke({"user_id": user_id, "card_id": card_id})
+        if result.get("status") == "success":
+            write_audit_log(
+                cif_no=user_id,
+                event_type="CARD_LOCKED",
+                actor="user",
+                session_id=session_id,
+                event_payload={"card_id": card_id},
+            )
+            return {"message": TEMPLATES["card_lock_success"].format(
+                masked_card_no=card_draft.masked_card_no or "?"
+            )}
+        return {"message": result.get("message", "Không thể khóa thẻ.")}
+
+    elif operation == "UNLOCK_CARD":
+        result = unlock_card.invoke({"user_id": user_id, "card_id": card_id})
+        if result.get("status") == "success":
+            write_audit_log(
+                cif_no=user_id,
+                event_type="CARD_UNLOCKED",
+                actor="user",
+                session_id=session_id,
+                event_payload={"card_id": card_id},
+            )
+            return {"message": TEMPLATES["card_unlock_success"].format(
+                masked_card_no=card_draft.masked_card_no or "?"
+            )}
+        return {"message": result.get("message", "Không thể mở khóa thẻ.")}
+
+    elif operation == "REPORT_LOST":
+        result = report_lost_card.invoke({"user_id": user_id, "card_id": card_id})
+        if result.get("status") == "success":
+            write_audit_log(
+                cif_no=user_id,
+                event_type="CARD_REPORTED_LOST",
+                actor="user",
+                session_id=session_id,
+                event_payload={"card_id": card_id},
+            )
+            return {"message": TEMPLATES["card_report_lost_success"].format(
+                masked_card_no=card_draft.masked_card_no or "?"
+            )}
+        return {"message": result.get("message", "Không thể báo mất thẻ.")}
+
+    return {"message": "Thao tác không hợp lệ."}
