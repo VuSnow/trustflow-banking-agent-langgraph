@@ -33,6 +33,12 @@ class ChatSessionStore:
                 )
                 cur.execute(
                     """
+                    ALTER TABLE chat_sessions
+                    ADD COLUMN IF NOT EXISTS active_task_id UUID DEFAULT NULL
+                    """
+                )
+                cur.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_updated_at
                     ON chat_sessions (user_id, updated_at DESC)
                     """
@@ -52,6 +58,8 @@ class ChatSessionStore:
 
     def _row_to_session(self, row, *, messages: list[dict] | None = None) -> dict:
         session = dict(row)
+        if session.get("active_task_id") is not None:
+            session["active_task_id"] = str(session["active_task_id"])
         if messages is not None:
             session["messages"] = messages
         return session
@@ -76,6 +84,7 @@ class ChatSessionStore:
                 "user_id": user_id,
                 "title": title,
                 "status": "active",
+                "active_task_id": None,
                 "created_at": now,
                 "updated_at": now,
                 "message_count": 0,
@@ -99,7 +108,8 @@ class ChatSessionStore:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT s.session_id, s.user_id, s.title, s.status, s.created_at, s.updated_at,
+                    SELECT s.session_id, s.user_id, s.title, s.status, s.active_task_id,
+                           s.created_at, s.updated_at,
                            COALESCE(s.message_count, 0) AS message_count,
                            s.last_message_at
                     FROM chat_sessions s
@@ -125,7 +135,8 @@ class ChatSessionStore:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT s.session_id, s.user_id, s.title, s.status, s.created_at, s.updated_at,
+                    SELECT s.session_id, s.user_id, s.title, s.status, s.active_task_id,
+                           s.created_at, s.updated_at,
                            COALESCE(s.message_count, 0) AS message_count,
                            s.last_message_at
                     FROM chat_sessions s
@@ -258,6 +269,18 @@ class ChatSessionStore:
                 cur.execute(
                     "UPDATE chat_sessions SET transaction_state = NULL WHERE session_id = %s",
                     (session_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def set_active_task_id(self, session_id: str, task_id: str | None) -> None:
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE chat_sessions SET active_task_id = %s, updated_at = %s WHERE session_id = %s",
+                    (task_id, self._now(), session_id),
                 )
             conn.commit()
         finally:

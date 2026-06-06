@@ -690,33 +690,29 @@ def build_orchestrator_graph() -> StateGraph:
 
 
 def _create_checkpointer():
-    """Create a PostgreSQL checkpointer for state persistence.
+    """Create an async-compatible runtime checkpointer.
 
-    Uses AsyncPostgresSaver for async compatibility with FastAPI/uvicorn.
-    Falls back to MemorySaver if PostgreSQL connection fails.
+    The async graph runtime calls async checkpoint APIs. The synchronous
+    PostgresSaver can set up tables, but cannot be returned to ainvoke().
     """
     try:
         from langgraph.checkpoint.postgres import PostgresSaver
         from backend.config import DATABASE_URL
         import psycopg
 
-        # Setup tables (sync, one-time)
         setup_conn = psycopg.connect(DATABASE_URL, autocommit=True)
-        saver = PostgresSaver(setup_conn)
-        saver.setup()
-        setup_conn.close()
-        logger.info("[CHECKPOINT] PostgreSQL tables ready")
-
-        # For async runtime, use MemorySaver since AsyncPostgresSaver
-        # requires async context manager which doesn't fit compile() pattern.
-        # State is still persisted via chat_session_store for FSM.
-        from langgraph.checkpoint.memory import MemorySaver
-        logger.info("[CHECKPOINT] Using MemorySaver for runtime (tables created in PG for future use)")
-        return MemorySaver()
+        try:
+            saver = PostgresSaver(setup_conn)
+            saver.setup()
+            logger.info("[CHECKPOINT] PostgreSQL tables ready")
+        finally:
+            setup_conn.close()
     except Exception as e:
-        logger.warning(f"[CHECKPOINT] Failed to init: {e}. Using MemorySaver.")
-        from langgraph.checkpoint.memory import MemorySaver
-        return MemorySaver()
+        logger.warning(f"[CHECKPOINT] Failed to setup PostgreSQL tables: {e}")
+
+    from langgraph.checkpoint.memory import MemorySaver
+    logger.info("[CHECKPOINT] Using MemorySaver runtime; task state is stored in conversation_tasks")
+    return MemorySaver()
 
 
 # Module-level checkpointer (singleton)

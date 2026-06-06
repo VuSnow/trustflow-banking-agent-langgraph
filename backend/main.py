@@ -11,16 +11,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.config import LOG_DIR, LOG_LEVEL
 from backend.services.chat_session_store import ChatSessionStore
+from backend.services.task_store import TaskStore
 from backend.routes import router as sessions_router, init as init_sessions
 from backend.routes.chat import router as chat_router, init as init_chat
 
-LOG_DIR = Path("/home/ubuntu/workspace/logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "trustflow-banking.log"
+LOG_LEVEL_VALUE = getattr(logging, LOG_LEVEL, logging.INFO)
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL_VALUE,
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     handlers=[
         logging.StreamHandler(),
@@ -28,6 +30,7 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+logger.debug("[LOGGING] Configured level=%s file=%s", logging.getLevelName(LOG_LEVEL_VALUE), LOG_FILE)
 
 # ─── App setup ────────────────────────────────────────────────────────────────
 
@@ -44,9 +47,10 @@ app.add_middleware(
 # ─── Initialize services ─────────────────────────────────────────────────────
 
 chat_session_store = ChatSessionStore()
+task_store = TaskStore()
 
-init_sessions(chat_session_store)
-init_chat(chat_session_store)
+init_sessions(chat_session_store, task_store)
+init_chat(chat_session_store, task_store)
 
 app.include_router(sessions_router)
 app.include_router(chat_router)

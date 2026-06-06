@@ -219,3 +219,5 @@ __marimo__/
 .streamlit/secrets.toml
 .vscode
 .finance_reports/
+
+equation.md
