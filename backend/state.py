@@ -28,7 +28,7 @@ class ChatState(TypedDict):
     response_message: str
     response_data: dict[str, Any]
     # FSM state
-    fsm_state: str  # idle, waiting_confirmation, waiting_otp, executed
+    fsm_state: str  # idle, waiting_confirmation, waiting_otp, executed, waiting_category_confirm
     pending_draft: dict[str, Any] | None
     # Pipeline
     pipeline_step: int

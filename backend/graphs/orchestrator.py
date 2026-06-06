@@ -395,11 +395,38 @@ async def otp_node(state: ChatState) -> dict:
         )
 
         if result.success:
+            # Predict category for the transaction
+            from backend.services.category_classifier import category_classifier
+            from backend.prompts.category_confirmation import CATEGORY_CONFIRM_MESSAGE_TEMPLATE
+
+            draft = state.get("pending_draft", {})
+            prediction = await category_classifier.predict(
+                user_id=state["user_id"],
+                description=draft.get("note", "") or draft.get("description", ""),
+                amount=draft.get("amount", 0),
+                counterparty_name=draft.get("recipient_name"),
+                counterparty_account_no=draft.get("account_no"),
+                bank_code=draft.get("bank_code"),
+            )
+
+            alt_list = "\n".join(
+                f"  {i+1}. {a['name']}" for i, a in enumerate(prediction["alternatives"])
+            )
+            category_msg = "\n\n" + CATEGORY_CONFIRM_MESSAGE_TEMPLATE.format(
+                predicted_name=prediction["predicted_name"],
+                alternatives_list=alt_list,
+            )
+
             return {
-                "fsm_state": "executed",
+                "fsm_state": "waiting_category_confirm",
                 "response_status": "info_response",
-                "response_message": result.message,
-                "response_data": {"executed": True, "transaction_ref": result.transaction_ref, **result.data},
+                "response_message": result.message + category_msg,
+                "response_data": {
+                    "executed": True,
+                    "transaction_ref": result.transaction_ref,
+                    "category_prediction": prediction,
+                    **result.data,
+                },
             }
         else:
             return {
@@ -423,6 +450,84 @@ async def otp_node(state: ChatState) -> dict:
         }
 
 
+async def category_confirm_node(state: ChatState) -> dict:
+    """Handle user response to category prediction after successful transaction."""
+    from backend.services.category_classifier import category_classifier
+    from backend.prompts.category_confirmation import (
+        CATEGORY_CONFIRMED_TEMPLATE,
+        CATEGORY_SKIPPED_MESSAGE,
+        CATEGORY_UNCLEAR_MESSAGE,
+    )
+
+    messages = state["messages"]
+    last_message = (messages[-1].content if messages else "").strip()
+    data = state.get("response_data", {})
+    prediction = data.get("category_prediction", {})
+    transaction_ref = data.get("transaction_ref", "")
+
+    # User skips
+    skip_keywords = ["bỏ qua", "skip", "thôi", "không cần"]
+    if any(k in last_message.lower() for k in skip_keywords):
+        return {
+            "fsm_state": "idle",
+            "pending_draft": None,
+            "response_status": "info_response",
+            "response_message": CATEGORY_SKIPPED_MESSAGE,
+        }
+
+    # User confirms prediction
+    confirm_keywords = ["đúng", "ok", "ừ", "uh", "yes", "đúng rồi", "chính xác"]
+    if any(last_message.lower() == k or last_message.lower().startswith(k) for k in confirm_keywords):
+        cat_id = prediction.get("predicted_category_id")
+        if cat_id:
+            category_classifier.update_category(transaction_ref, cat_id)
+        return {
+            "fsm_state": "idle",
+            "pending_draft": None,
+            "response_status": "info_response",
+            "response_message": CATEGORY_CONFIRMED_TEMPLATE.format(
+                category_name=prediction.get("predicted_name", ""),
+            ),
+        }
+
+    # User picks by number
+    alternatives = prediction.get("alternatives", [])
+    if last_message.isdigit():
+        idx = int(last_message) - 1
+        if 0 <= idx < len(alternatives):
+            chosen = alternatives[idx]
+            category_classifier.update_category(transaction_ref, chosen["category_id"])
+            return {
+                "fsm_state": "idle",
+                "pending_draft": None,
+                "response_status": "info_response",
+                "response_message": CATEGORY_CONFIRMED_TEMPLATE.format(
+                    category_name=chosen["name"],
+                ),
+            }
+
+    # Try matching by name from alternatives
+    for alt in alternatives:
+        if alt["name"].lower() in last_message.lower() or alt["code"].lower() in last_message.lower():
+            category_classifier.update_category(transaction_ref, alt["category_id"])
+            return {
+                "fsm_state": "idle",
+                "pending_draft": None,
+                "response_status": "info_response",
+                "response_message": CATEGORY_CONFIRMED_TEMPLATE.format(
+                    category_name=alt["name"],
+                ),
+            }
+
+    # Unclear response — keep default
+    return {
+        "fsm_state": "idle",
+        "pending_draft": None,
+        "response_status": "info_response",
+        "response_message": CATEGORY_UNCLEAR_MESSAGE,
+    }
+
+
 # ─── Routing functions ────────────────────────────────────────────────────────
 
 def route_by_fsm_state(state: ChatState) -> str:
@@ -432,6 +537,8 @@ def route_by_fsm_state(state: ChatState) -> str:
         return "confirmation"
     elif fsm == "waiting_otp":
         return "otp"
+    elif fsm == "waiting_category_confirm":
+        return "category_confirm"
     else:
         return "classify_intent"
 
@@ -491,8 +598,8 @@ def route_after_confirmation(state: ChatState) -> str:
 def route_after_otp(state: ChatState) -> str:
     """Route after OTP validation."""
     fsm = state.get("fsm_state", "")
-    if fsm == "executed":
-        return END
+    if fsm in ("executed", "waiting_category_confirm"):
+        return END  # Response includes category question or execution done
     else:
         return END  # Failed OTP, ask again
 
@@ -518,6 +625,7 @@ def build_orchestrator_graph() -> StateGraph:
     graph.add_node("guardrails", guardrails_node)
     graph.add_node("confirmation", confirmation_node)
     graph.add_node("otp", otp_node)
+    graph.add_node("category_confirm", category_confirm_node)
 
     # Entry point — check FSM state first
     graph.set_entry_point("entry")
@@ -530,6 +638,7 @@ def build_orchestrator_graph() -> StateGraph:
             "classify_intent": "classify_intent",
             "confirmation": "confirmation",
             "otp": "otp",
+            "category_confirm": "category_confirm",
         },
     )
 
@@ -573,6 +682,9 @@ def build_orchestrator_graph() -> StateGraph:
 
     # OTP → END
     graph.add_conditional_edges("otp", route_after_otp, {END: END})
+
+    # Category confirm → END
+    graph.add_edge("category_confirm", END)
 
     return graph
 
