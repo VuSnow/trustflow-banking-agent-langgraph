@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 
 from backend.config import OPENAI_API_KEY, OPENAI_MODEL, CURRENT_BANK_CODE
@@ -73,7 +73,7 @@ _flow_router = FlowRouter()
 # ─── Intent Classifier ────────────────────────────────────────────────────────
 
 
-async def _classify_intent(message: str) -> str | None:
+async def _classify_intent(messages: list[BaseMessage]) -> str | None:
     """Classify message into intent type using LLM.
 
     Returns composite key like 'TRANSACTION:TRANSFER_MONEY' or just task_type.
@@ -82,10 +82,13 @@ async def _classify_intent(message: str) -> str | None:
     llm = ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY, temperature=0.0)
 
     try:
-        response = await llm.ainvoke([
-            SystemMessage(content=INTENT_SYSTEM_PROMPT),
-            HumanMessage(content=INTENT_USER_TEMPLATE.format(message=message)),
-        ])
+        current_message = messages[-1].content if messages else ""
+        prompt_messages = [SystemMessage(content=INTENT_SYSTEM_PROMPT)]
+        prompt_messages.extend(messages[:-1][-8:])
+        prompt_messages.append(
+            HumanMessage(content=INTENT_USER_TEMPLATE.format(message=current_message))
+        )
+        response = await llm.ainvoke(prompt_messages)
         data = json.loads(response.content)
         task_type = data.get("task_type", "UNKNOWN")
         operation = data.get("operation")
@@ -344,10 +347,12 @@ async def dispatch_agent_node(state: ChatState) -> dict:
             # QA — answer directly without starting flow
             from backend.agents.qa import run_qa_agent
 
+            qa_history = _serialize_message_history(messages[:-1])
             qa_result = await run_qa_agent(
                 message=last_message,
                 user_id=state["user_id"],
                 session_id=state["session_id"],
+                history=qa_history,
             )
             result = {
                 "response_message": qa_result["message"],
@@ -356,6 +361,25 @@ async def dispatch_agent_node(state: ChatState) -> dict:
             if _category_was_cleared:
                 result["active_flow"] = None
             return result
+
+        if intent == "FRAUD_REPORT":
+            from backend.agents.fraud_report import run_fraud_agent
+
+            fraud_history = _serialize_message_history(messages[:-1])
+            fraud_result = await run_fraud_agent(
+                message=last_message,
+                user_id=state["user_id"],
+                session_id=state["session_id"],
+                history=fraud_history,
+            )
+            return {
+                "response_message": fraud_result["message"],
+                "response_data": {
+                    "handled": True,
+                    "task_type": "FRAUD_REPORT",
+                    "agent_result": fraud_result,
+                },
+            }
 
         if intent and intent.startswith("TRANSACTION"):
             operation = intent.split(":")[-1] if ":" in intent else ""
@@ -1712,6 +1736,24 @@ def _intent_display_name(intent: str) -> str:
     return names.get(intent, intent.lower())
 
 
+def _serialize_message_history(messages: list[BaseMessage]) -> list[dict]:
+    """Convert LangChain messages into the fraud agent history shape."""
+    history: list[dict] = []
+    for msg in messages:
+        role = "assistant"
+        if isinstance(msg, HumanMessage):
+            role = "user"
+        elif isinstance(msg, AIMessage):
+            role = "assistant"
+        else:
+            msg_type = msg.__class__.__name__.lower()
+            if "human" in msg_type:
+                role = "user"
+
+        content = getattr(msg, "content", "")
+        if content:
+            history.append({"role": role, "message": content})
+    return history
 # ─── Bill Payment Helpers ─────────────────────────────────────────────────────
 
 
