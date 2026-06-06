@@ -501,10 +501,36 @@ async def dispatch_agent_node(state: ChatState) -> dict:
                 },
             }
 
-        else:
-            # Non-transaction intent
+        elif intent in ("FINANCE_ADVICE", "DATA_QUERY"):
+            from backend.agents.finance_advisor import run_finance_agent
+
+            # Build history from messages for context
+            history = []
+            for msg in messages[:-1]:  # exclude current message
+                if hasattr(msg, "type"):
+                    if msg.type == "human":
+                        history.append({"role": "user", "message": msg.content})
+                    elif msg.type == "ai" and msg.content:
+                        history.append({"role": "assistant", "message": msg.content})
+
+            finance_result = await run_finance_agent(
+                message=last_message,
+                user_id=state["user_id"],
+                session_id=state["session_id"],
+                history=history or None,
+            )
             result = {
-                "response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, nạp tiền, và quản lý thẻ.",
+                "response_message": finance_result["message"],
+                "response_data": {"handled": True, "task_type": "FINANCE_ADVICE"},
+            }
+            if _category_was_cleared:
+                result["active_flow"] = None
+            return result
+
+        else:
+            # Non-supported intent
+            result = {
+                "response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, nạp tiền, quản lý thẻ, và tư vấn tài chính.",
                 "response_data": {"handled": True},
             }
             if _category_was_cleared:
