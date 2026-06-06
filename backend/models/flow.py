@@ -183,6 +183,8 @@ class FlowState(BaseModel):
         if self.status in (
             "WAITING_RECIPIENT_CONFIRMATION",
             "WAITING_DRAFT_CONFIRMATION",
+            "WAITING_BILL_CONFIRMATION",
+            "WAITING_TOPUP_CONFIRMATION",
         ):
             return "limited"
         return "flexible"
