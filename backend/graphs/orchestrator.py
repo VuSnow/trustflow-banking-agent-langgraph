@@ -1,774 +1,1031 @@
-"""Main Orchestrator Graph — LangGraph StateGraph implementation.
+"""Main Orchestrator Graph — Controlled Agentic Workflow.
 
-Replaces the manual orchestrator + pipeline + FSM logic with a single
-LangGraph StateGraph that handles:
-1. Intent classification (router node)
-2. Domain agent dispatch (conditional edges)
-3. FSM states: confirmation & OTP (graph nodes with conditional routing)
-4. Guardrails (node before confirmation)
+Architecture:
+  route_node → dispatch_agent_node → handle_flow_action_node → format_response_node
 
-Flow:
-  classify_intent → route_to_agent → [domain_agent] → check_draft → guardrails → confirm → otp → execute
-                                                     → info_response (terminal)
-                                                     → clarification (terminal, waits for next input)
+Design principles:
+- Agent (LLM) ONLY extracts entities and resolves information
+- State transitions are deterministic (no LLM decides OTP/confirm/execute)
+- FlowRouter uses status-first dispatch (locked > pending_question > limited > flexible)
+- Response formatting uses templates for sensitive messages (money, accounts)
 """
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Literal
+import uuid
+from datetime import datetime
+from typing import Any
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 
-from backend.config import OPENAI_API_KEY, OPENAI_MODEL
+from backend.config import OPENAI_API_KEY, OPENAI_MODEL, CURRENT_BANK_CODE
 from backend.state import ChatState
-from backend.prompts.intent import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
-from backend.agents.transaction import run_transaction_agent
-from backend.agents.card_operation import run_card_agent
-from backend.agents.account_operation import run_account_agent
-from backend.agents.fraud_report import run_fraud_agent
-from backend.agents.bill_payment import run_bill_agent
-from backend.agents.topup import run_topup_agent
-from backend.agents.finance_advisor import run_finance_agent
-from backend.agents.qa import run_qa_agent
-from backend.agents.data_query import run_data_query_agent
-from backend.services.guardrails import check_transaction_guardrails, validate_otp
-from backend.services.confirmation_classifier import classify_confirmation
+from backend.models.flow import (
+    FlowState,
+    TransactionDraft,
+    BillDraft,
+    TopUpDraft,
+    PendingQuestion,
+    InterruptedIntent,
+    RecipientResolutionPlan,
+    serialize_flow,
+    deserialize_flow,
+)
+from backend.services.flow_router import (
+    FlowRouter,
+    RouteDecision,
+    serialize_route_decision,
+)
+from backend.services.recipient_resolver import RecipientResolver, ResolutionResult, _mask_account
+from backend.services.transaction_validator import TransactionValidator
+from backend.services.otp_service import otp_service
 from backend.services.audit_log import write_audit_log
+from backend.services.langfuse_trace import get_trace_config
+from backend.agents.transaction import TransactionExtractor
+from backend.prompts.intent import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
+# ─── Singletons ───────────────────────────────────────────────────────────────
 
-# ─── Node functions ───────────────────────────────────────────────────────────
+_recipient_resolver = RecipientResolver()
+_validator = TransactionValidator()
+_extractor = TransactionExtractor()
+_flow_router = FlowRouter()
 
-async def classify_intent_node(state: ChatState) -> dict:
-    """Classify user intent using LLM."""
-    # If already in FSM state, skip classification
-    if state.get("fsm_state") in ("waiting_confirmation", "waiting_otp"):
-        return {}
 
+# ─── Intent Classifier ────────────────────────────────────────────────────────
+
+
+async def _classify_intent(message: str) -> str | None:
+    """Classify message into intent type using LLM.
+
+    Returns composite key like 'TRANSACTION:TRANSFER_MONEY' or just task_type.
+    Returns None for QA (no flow needed).
+    """
     llm = ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY, temperature=0.0)
 
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-
-    # Build context with recent history
-    chat_messages = [SystemMessage(content=INTENT_SYSTEM_PROMPT)]
-    for msg in messages[-10:]:
-        if isinstance(msg, HumanMessage):
-            chat_messages.append(msg)
-        elif isinstance(msg, AIMessage):
-            chat_messages.append(msg)
-
-    chat_messages.append(HumanMessage(content=INTENT_USER_TEMPLATE.format(message=last_message)))
-
     try:
-        response = await llm.ainvoke(chat_messages)
+        response = await llm.ainvoke([
+            SystemMessage(content=INTENT_SYSTEM_PROMPT),
+            HumanMessage(content=INTENT_USER_TEMPLATE.format(message=message)),
+        ])
         data = json.loads(response.content)
-        logger.info(f"[INTENT] {data}")
-        return {
-            "intent": data.get("task_type", "QA"),
-            "operation": data.get("operation"),
-            "confidence": data.get("confidence", 0.0),
-        }
+        task_type = data.get("task_type", "UNKNOWN")
+        operation = data.get("operation")
+        if task_type == "QA":
+            return None
+        if task_type == "TRANSACTION" and operation:
+            return f"TRANSACTION:{operation}"
+        return task_type
     except Exception as e:
-        logger.error(f"[INTENT] Error: {e}")
-        return {"intent": "QA", "operation": None, "confidence": 0.0}
+        logger.warning(f"[INTENT_CLF] Error: {e}")
+        return None
 
 
-async def transaction_agent_node(state: ChatState) -> dict:
-    """Run transaction agent."""
+# ─── Response Templates ───────────────────────────────────────────────────────
+
+TEMPLATES = {
+    "recipient_candidates": (
+        "Tôi tìm thấy {count} người tên \"{query}\":\n\n"
+        "{candidates_list}\n\n"
+        "Bạn muốn chuyển cho ai? (Nhập số thứ tự)"
+    ),
+    "recipient_confirm": (
+        "Tôi tìm thấy người nhận:\n"
+        "• Tên: {name}\n"
+        "• Ngân hàng: {bank}\n"
+        "• Số tài khoản: {masked_account}\n\n"
+        "Đây có đúng là người bạn muốn chuyển không?"
+    ),
+    "draft_summary": (
+        "Vui lòng kiểm tra thông tin giao dịch:\n\n"
+        "Từ tài khoản: {source}\n"
+        "Đến: {recipient_name}\n"
+        "Ngân hàng: {bank}\n"
+        "Số tài khoản: {masked_account}\n"
+        "Số tiền: {amount}\n"
+        "Phí giao dịch: {fee}\n"
+        "Tổng tiền trừ: {total_debit}\n"
+        "Nội dung: {note}\n\n"
+        "Bạn xác nhận thực hiện giao dịch này chứ?"
+    ),
+    "otp_request": (
+        "Tôi đã gửi mã OTP đến số điện thoại đăng ký của bạn.\n"
+        "Vui lòng nhập OTP để hoàn tất giao dịch.\n\n"
+        "Giao dịch: chuyển {amount} đến {recipient_name}."
+    ),
+    "success_receipt": (
+        "Giao dịch thành công.\n\n"
+        "Mã giao dịch: {ref}\n"
+        "Thời gian: {time}\n"
+        "Từ tài khoản: {source}\n"
+        "Người nhận: {recipient_name}\n"
+        "Ngân hàng: {bank}\n"
+        "Số tài khoản nhận: {masked_account}\n\n"
+        "Số tiền chuyển: {amount}\n"
+        "Phí giao dịch: {fee}\n"
+        "Tổng tiền đã trừ: {total_debit}\n"
+        "Số dư còn lại: {balance}"
+    ),
+    "otp_wrong": "Mã OTP không đúng. Còn {remaining} lần thử. Vui lòng nhập lại.",
+    "otp_expired": "Mã OTP đã hết hạn. Vui lòng thực hiện lại giao dịch.",
+    "otp_max_attempts": "Đã vượt quá số lần nhập OTP. Giao dịch đã bị hủy vì lý do bảo mật.",
+    "otp_hash_mismatch": "Thông tin giao dịch đã thay đổi. Vui lòng xác nhận lại giao dịch.",
+    "interrupt_locked": (
+        "Bạn đang có giao dịch chờ xác thực OTP:\n\n"
+        "Chuyển {amount} đến {recipient_name}\n\n"
+        "Để tiếp tục việc khác, bạn cần:\n"
+        "1. Nhập OTP để hoàn tất giao dịch\n"
+        "2. Hủy giao dịch này\n\n"
+        "Bạn muốn nhập OTP hay hủy giao dịch?"
+    ),
+    "cancelled": "Đã hủy giao dịch.",
+    "ask_valid_otp": (
+        "Vui lòng nhập mã OTP 6 số đã gửi đến điện thoại của bạn, "
+        "hoặc nhập \"hủy\" để hủy giao dịch."
+    ),
+    "ask_confirm_or_cancel": "Tôi chưa hiểu rõ. Bạn muốn xác nhận hay hủy giao dịch?",
+    "need_recipient": "Bạn muốn chuyển tiền cho ai? Vui lòng cho tôi biết tên người nhận hoặc số tài khoản.",
+    "need_amount": "Bạn muốn chuyển bao nhiêu tiền?",
+    "recipient_not_found": (
+        "Tôi không tìm thấy người nhận \"{query}\" trong danh sách.\n"
+        "Vui lòng cung cấp số tài khoản và ngân hàng, hoặc kiểm tra lại tên."
+    ),
+    "fraud_warning_high": (
+        "⚠️ CẢNH BÁO: Tài khoản nhận có {report_count} báo cáo nghi ngờ lừa đảo "
+        "với mức rủi ro CAO. Vui lòng cân nhắc kỹ trước khi tiếp tục."
+    ),
+    "fraud_block": (
+        "⚠️ Tài khoản này đã bị xác nhận là tài khoản lừa đảo. "
+        "Giao dịch không thể thực hiện."
+    ),
+}
+
+
+# ─── Node: route_node ─────────────────────────────────────────────────────────
+
+
+async def route_node(state: ChatState) -> dict:
+    """Deterministic routing based on flow state."""
+    flow = deserialize_flow(state.get("active_flow"))
     messages = state["messages"]
     last_message = messages[-1].content if messages else ""
 
-    history = _messages_to_history(messages[:-1])
-    result = await run_transaction_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-        history=history,
+    decision = await _flow_router.route(flow, last_message)
+
+    logger.info(
+        f"[ROUTE] action={decision.action} flow_status={flow.status if flow else 'none'}"
     )
 
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
+    return {"route_decision": serialize_route_decision(decision)}
 
 
-async def bill_agent_node(state: ChatState) -> dict:
-    """Run bill payment agent."""
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-
-    history = _messages_to_history(messages[:-1])
-    result = await run_bill_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-        history=history,
-    )
-
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
+# ─── Node: dispatch_agent_node ────────────────────────────────────────────────
 
 
-async def topup_agent_node(state: ChatState) -> dict:
-    """Run top-up agent."""
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
+async def dispatch_agent_node(state: ChatState) -> dict:
+    """Dispatch to appropriate agent based on route decision.
 
-    history = _messages_to_history(messages[:-1])
-    result = await run_topup_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-        history=history,
-    )
-
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
-
-
-async def card_agent_node(state: ChatState) -> dict:
-    """Run card operation agent."""
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-
-    history = _messages_to_history(messages[:-1])
-    result = await run_card_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-        history=history,
-    )
-
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
-
-
-async def qa_agent_node(state: ChatState) -> dict:
-    """Run QA agent."""
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-
-    result = await run_qa_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-    )
-
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
-
-
-async def data_query_agent_node(state: ChatState) -> dict:
-    """Run data query agent."""
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-
-    history = _messages_to_history(messages[:-1])
-    result = await run_data_query_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-        history=history,
-    )
-
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
-
-
-async def finance_agent_node(state: ChatState) -> dict:
-    """Run finance advisor agent."""
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-
-    history = _messages_to_history(messages[:-1])
-    result = await run_finance_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-        history=history,
-    )
-
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
-
-
-async def account_agent_node(state: ChatState) -> dict:
-    """Run account operation agent."""
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-
-    history = _messages_to_history(messages[:-1])
-    result = await run_account_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-        history=history,
-    )
-
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
-
-
-async def fraud_agent_node(state: ChatState) -> dict:
-    """Run fraud report agent."""
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-
-    history = _messages_to_history(messages[:-1])
-    result = await run_fraud_agent(
-        message=last_message,
-        user_id=state["user_id"],
-        session_id=state["session_id"],
-        history=history,
-    )
-
-    return {
-        "response_status": result["status"],
-        "response_message": result["message"],
-        "response_data": result.get("data", {}),
-    }
-
-
-async def guardrails_node(state: ChatState) -> dict:
-    """Apply guardrails to the draft and determine FSM state."""
-    data = state.get("response_data", {})
-    fraud_screening = data.get("fraud_screening")
-    amount = data.get("amount")
-
-    guardrail_result = check_transaction_guardrails(
-        amount=amount,
-        fraud_screening=fraud_screening,
-    )
-
-    write_audit_log(
-        cif_no=state["user_id"],
-        event_type="GUARDRAIL_EVALUATED",
-        actor="guardrail",
-        session_id=state["session_id"],
-        event_payload={"result": guardrail_result, "draft": data},
-    )
-
-    if guardrail_result["blocked"]:
-        return {
-            "response_status": "blocked",
-            "response_message": guardrail_result["reason"],
-            "fsm_state": "idle",
-            "pending_draft": None,
-        }
-
-    # Transaction requires confirmation then OTP
-    confirmation_msg = state.get("response_message", "")
-    if guardrail_result.get("warning_message"):
-        confirmation_msg = guardrail_result["warning_message"] + "\n\n" + confirmation_msg
-
-    return {
-        "fsm_state": "waiting_confirmation",
-        "pending_draft": data,
-        "response_message": confirmation_msg + "\n\nBạn có muốn tiếp tục không?",
-    }
-
-
-async def confirmation_node(state: ChatState) -> dict:
-    """Handle user confirmation response.
-
-    If user asks an unrelated question (classified as UNCLEAR and looks like
-    a new intent), route back to classify_intent while preserving the pending draft.
+    Only called when route_decision.action indicates agent work is needed:
+    - CLASSIFY_NEW_INTENT → intent classifier + possibly start new flow
+    - CONTINUE_COLLECTING → transaction extractor
+    - ANSWER_PENDING_QUESTION → may need extractor for interpretation
     """
-    messages = state["messages"]
-    last_message = messages[-1].content if messages else ""
-    draft = state.get("pending_draft", {})
-
-    draft_summary = (
-        f"{draft.get('amount', '?'):,} VND → {draft.get('recipient_name', '?')} "
-        f"({draft.get('account_no', '?')}) @ {draft.get('bank_name', '?')}"
-    )
-
-    result = await classify_confirmation(last_message, draft_summary=draft_summary)
-    classification = result["classification"]
-
-    write_audit_log(
-        cif_no=state["user_id"],
-        event_type="CONFIRMATION_CLASSIFIED",
-        actor="classifier",
-        session_id=state["session_id"],
-        event_payload={"classification": classification, "reason": result.get("reason", "")},
-    )
-
-    if classification == "CONFIRM":
-        return {
-            "fsm_state": "waiting_otp",
-            "response_status": "needs_otp",
-            "response_message": "Vui lòng nhập mã OTP đã gửi đến số điện thoại của bạn.",
-        }
-    elif classification == "CANCEL":
-        return {
-            "fsm_state": "idle",
-            "pending_draft": None,
-            "response_status": "info_response",
-            "response_message": "Đã hủy giao dịch.",
-        }
-    elif classification == "MODIFY":
-        return {
-            "fsm_state": "idle",
-            "pending_draft": None,
-            "response_status": "info_response",
-            "response_message": "Đã hủy giao dịch. Vui lòng cho tôi biết bạn muốn thay đổi gì.",
-        }
-    else:  # UNCLEAR — check if it's a side question
-        # If the message is long or looks like a new question, handle it
-        # while keeping the draft pending
-        if _looks_like_new_intent(last_message):
-            return {
-                "fsm_state": "waiting_confirmation",  # keep draft alive
-                "response_status": "side_question",
-                "response_message": last_message,  # will be re-routed
-            }
-        return {
-            "response_status": "clarification_needed",
-            "response_message": (
-                "Tôi chưa hiểu rõ. Bạn muốn xác nhận hay hủy giao dịch?\n"
-                f"(Giao dịch đang chờ: {draft_summary})"
-            ),
-        }
-
-
-async def otp_node(state: ChatState) -> dict:
-    """Handle OTP verification. On success, execute via appropriate Executor."""
-    from backend.executor.transaction_executor import TransactionExecutor
-    from backend.executor.bill_executor import BillPaymentExecutor
-    from backend.executor.topup_executor import TopUpExecutor
-
+    decision_data = state.get("route_decision", {})
+    action = decision_data.get("action", "")
+    flow = deserialize_flow(state.get("active_flow"))
     messages = state["messages"]
     last_message = messages[-1].content if messages else ""
 
-    if validate_otp(last_message):
-        write_audit_log(
-            cif_no=state["user_id"],
-            event_type="OTP_VALIDATED",
-            actor="system",
-            session_id=state["session_id"],
-            event_payload={"success": True},
-        )
+    if action == "CLASSIFY_NEW_INTENT":
+        intent = await _classify_intent(last_message)
 
-        draft = state.get("pending_draft", {})
-        action = draft.get("action", draft.get("operation", ""))
+        if intent is None:
+            # QA — answer directly without starting flow
+            from backend.agents.qa import run_qa_agent
 
-        # Route to appropriate executor
-        if action == "BILL_PAYMENT":
-            executor = BillPaymentExecutor()
-        elif action == "TOP_UP":
-            executor = TopUpExecutor()
-        else:
-            executor = TransactionExecutor()
-
-        result = await executor.execute(
-            draft=draft,
-            user_id=state["user_id"],
-            session_id=state["session_id"],
-        )
-
-        if result.success:
-            # Predict category for the transaction
-            from backend.services.category_classifier import category_classifier
-            from backend.prompts.category_confirmation import CATEGORY_CONFIRM_MESSAGE_TEMPLATE
-
-            draft = state.get("pending_draft", {})
-            prediction = await category_classifier.predict(
+            qa_result = await run_qa_agent(
+                message=last_message,
                 user_id=state["user_id"],
-                description=draft.get("note", "") or draft.get("description", ""),
-                amount=draft.get("amount", 0),
-                counterparty_name=draft.get("recipient_name"),
-                counterparty_account_no=draft.get("account_no"),
-                bank_code=draft.get("bank_code"),
+                session_id=state["session_id"],
+            )
+            return {
+                "response_message": qa_result["message"],
+                "response_data": {"handled": True, "task_type": "QA"},
+            }
+
+        if intent and intent.startswith("TRANSACTION"):
+            # Run extractor for initial fields
+            result = await _extractor.process(
+                message=last_message,
+                user_id=state["user_id"],
+                current_draft=None,
+                pending_question=None,
+                session_id=state["session_id"],
             )
 
-            alt_list = "\n".join(
-                f"  {i+1}. {a['name']}" for i, a in enumerate(prediction["alternatives"])
+            # Start new flow
+            new_flow = FlowState(
+                flow_type="TRANSACTION",
+                status="COLLECTING",
+                draft=TransactionDraft(),
             )
-            category_msg = "\n\n" + CATEGORY_CONFIRM_MESSAGE_TEMPLATE.format(
-                predicted_name=prediction["predicted_name"],
-                alternatives_list=alt_list,
-            )
+            new_flow = _apply_extraction_to_flow(new_flow, result)
 
             return {
-                "fsm_state": "waiting_category_confirm",
-                "response_status": "info_response",
-                "response_message": result.message + category_msg,
+                "active_flow": serialize_flow(new_flow),
                 "response_data": {
-                    "executed": True,
-                    "transaction_ref": result.transaction_ref,
-                    "category_prediction": prediction,
-                    **result.data,
+                    "agent_result": {
+                        "extracted_fields": result.extracted_fields,
+                        "recipient_resolution_plan": (
+                            result.recipient_resolution_plan.model_dump()
+                            if result.recipient_resolution_plan
+                            else None
+                        ),
+                        "missing_fields": result.missing_fields,
+                        "interpretation": result.interpretation,
+                    }
                 },
             }
         else:
+            # Non-transaction intent — respond that only TRANSACTION supported in Phase 1
             return {
-                "fsm_state": "idle",
-                "pending_draft": None,
-                "response_status": "info_response",
-                "response_message": result.message,
-                "response_data": {"executed": False, "error_code": result.error_code},
+                "response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền trong bản demo này.",
+                "response_data": {"handled": True},
             }
-    else:
-        write_audit_log(
-            cif_no=state["user_id"],
-            event_type="OTP_FAILED",
-            actor="system",
+
+    elif action in ("CONTINUE_COLLECTING", "ANSWER_PENDING_QUESTION"):
+        # Run extractor with current draft context
+        draft = flow.draft if flow else None
+        pending_q = flow.pending_question if flow else None
+
+        result = await _extractor.process(
+            message=last_message,
+            user_id=state["user_id"],
+            current_draft=draft,
+            pending_question=pending_q,
             session_id=state["session_id"],
-            event_payload={"success": False},
         )
+
+        if flow:
+            flow = _apply_extraction_to_flow(flow, result)
+
         return {
-            "response_status": "needs_otp",
-            "response_message": "Mã OTP không đúng. Vui lòng nhập lại.",
+            "active_flow": serialize_flow(flow),
+            "response_data": {
+                "agent_result": {
+                    "extracted_fields": result.extracted_fields,
+                    "recipient_resolution_plan": (
+                        result.recipient_resolution_plan.model_dump()
+                        if result.recipient_resolution_plan
+                        else None
+                    ),
+                    "missing_fields": result.missing_fields,
+                    "interpretation": result.interpretation,
+                }
+            },
         }
 
+    elif action == "MODIFY_DRAFT":
+        draft = flow.draft if flow else None
+        result = await _extractor.process(
+            message=last_message,
+            user_id=state["user_id"],
+            current_draft=draft,
+            pending_question=None,
+            session_id=state["session_id"],
+        )
 
-async def category_confirm_node(state: ChatState) -> dict:
-    """Handle user response to category prediction after successful transaction."""
-    from backend.services.category_classifier import category_classifier
-    from backend.prompts.category_confirmation import (
-        CATEGORY_CONFIRMED_TEMPLATE,
-        CATEGORY_SKIPPED_MESSAGE,
-        CATEGORY_UNCLEAR_MESSAGE,
-    )
+        if flow:
+            flow = _apply_extraction_to_flow(flow, result)
+            flow.status = "COLLECTING"
+            flow.pending_question = None
 
-    messages = state["messages"]
-    last_message = (messages[-1].content if messages else "").strip()
-    data = state.get("response_data", {})
-    prediction = data.get("category_prediction", {})
-    transaction_ref = data.get("transaction_ref", "")
-
-    # User skips
-    skip_keywords = ["bỏ qua", "skip", "thôi", "không cần"]
-    if any(k in last_message.lower() for k in skip_keywords):
         return {
-            "fsm_state": "idle",
-            "pending_draft": None,
-            "response_status": "info_response",
-            "response_message": CATEGORY_SKIPPED_MESSAGE,
+            "active_flow": serialize_flow(flow),
+            "response_data": {
+                "agent_result": {
+                    "extracted_fields": result.extracted_fields,
+                    "recipient_resolution_plan": (
+                        result.recipient_resolution_plan.model_dump()
+                        if result.recipient_resolution_plan
+                        else None
+                    ),
+                    "missing_fields": result.missing_fields,
+                },
+            },
         }
 
-    # User confirms prediction
-    confirm_keywords = ["đúng", "ok", "ừ", "uh", "yes", "đúng rồi", "chính xác"]
-    if any(last_message.lower() == k or last_message.lower().startswith(k) for k in confirm_keywords):
-        cat_id = prediction.get("predicted_category_id")
-        if cat_id:
-            category_classifier.update_category(transaction_ref, cat_id)
-        return {
-            "fsm_state": "idle",
-            "pending_draft": None,
-            "response_status": "info_response",
-            "response_message": CATEGORY_CONFIRMED_TEMPLATE.format(
-                category_name=prediction.get("predicted_name", ""),
-            ),
-        }
-
-    # User picks by number
-    alternatives = prediction.get("alternatives", [])
-    if last_message.isdigit():
-        idx = int(last_message) - 1
-        if 0 <= idx < len(alternatives):
-            chosen = alternatives[idx]
-            category_classifier.update_category(transaction_ref, chosen["category_id"])
-            return {
-                "fsm_state": "idle",
-                "pending_draft": None,
-                "response_status": "info_response",
-                "response_message": CATEGORY_CONFIRMED_TEMPLATE.format(
-                    category_name=chosen["name"],
-                ),
-            }
-
-    # Try matching by name from alternatives
-    for alt in alternatives:
-        if alt["name"].lower() in last_message.lower() or alt["code"].lower() in last_message.lower():
-            category_classifier.update_category(transaction_ref, alt["category_id"])
-            return {
-                "fsm_state": "idle",
-                "pending_draft": None,
-                "response_status": "info_response",
-                "response_message": CATEGORY_CONFIRMED_TEMPLATE.format(
-                    category_name=alt["name"],
-                ),
-            }
-
-    # Unclear response — keep default
-    return {
-        "fsm_state": "idle",
-        "pending_draft": None,
-        "response_status": "info_response",
-        "response_message": CATEGORY_UNCLEAR_MESSAGE,
-    }
-
-
-# ─── Routing functions ────────────────────────────────────────────────────────
-
-def route_by_fsm_state(state: ChatState) -> str:
-    """Route based on current FSM state (handles re-entry for confirmation/OTP)."""
-    fsm = state.get("fsm_state", "idle")
-    if fsm == "waiting_confirmation":
-        return "confirmation"
-    elif fsm == "waiting_otp":
-        return "otp"
-    elif fsm == "waiting_category_confirm":
-        return "category_confirm"
-    else:
-        return "classify_intent"
-
-
-async def entry_node(state: ChatState) -> dict:
-    """Entry node — pass-through to enable conditional routing."""
+    # For other actions, dispatch is a pass-through
     return {}
 
 
-def route_by_intent(state: ChatState) -> str:
-    """Route to appropriate domain agent based on classified intent."""
-    intent = state.get("intent", "QA")
-    operation = state.get("operation", "")
-
-    # TRANSACTION intent splits by operation
-    if intent == "TRANSACTION":
-        if operation == "BILL_PAYMENT":
-            return "bill_agent"
-        if operation == "TOP_UP":
-            return "topup_agent"
-        return "transaction_agent"
-
-    routing = {
-        "CARD_OPERATION": "card_agent",
-        "ACCOUNT_OPERATION": "account_agent",
-        "FRAUD_REPORT": "fraud_agent",
-        "DATA_QUERY": "data_query_agent",
-        "QA": "qa_agent",
-        "FINANCE_ADVICE": "finance_agent",
-    }
-    return routing.get(intent, "qa_agent")
+# ─── Node: handle_flow_action_node ───────────────────────────────────────────
 
 
-def route_after_agent(state: ChatState) -> str:
-    """Route after domain agent completes — check if draft needs guardrails."""
-    status = state.get("response_status", "")
-    if status == "draft_ready":
-        return "guardrails"
-    else:
-        return END
+async def handle_flow_action_node(state: ChatState) -> dict:
+    """Execute flow state transitions deterministically.
+
+    All sensitive transitions happen here:
+    - Recipient resolution + verification
+    - Fee calculation
+    - Draft confirmation assembly
+    - OTP challenge creation / validation
+    - Transaction execution
+    - Flow cancellation
+    """
+    decision_data = state.get("route_decision", {})
+    action = decision_data.get("action", "")
+    flow = deserialize_flow(state.get("active_flow"))
+    response_data = state.get("response_data", {})
+    user_id = state["user_id"]
+    session_id = state["session_id"]
+
+    # If response already handled (QA, unsupported)
+    if response_data.get("handled"):
+        return {}
+    if state.get("response_message"):
+        return {}
+
+    # ─── CLASSIFY_NEW_INTENT / CONTINUE_COLLECTING / MODIFY_DRAFT ─────
+    if action in ("CLASSIFY_NEW_INTENT", "CONTINUE_COLLECTING", "MODIFY_DRAFT", "ANSWER_PENDING_QUESTION"):
+        if not flow or not flow.draft:
+            return {"response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền trong bản demo này."}
+
+        agent_result = response_data.get("agent_result", {})
+        plan_data = agent_result.get("recipient_resolution_plan")
+
+        # Step A: Resolve recipient if plan provided
+        if plan_data:
+            plan = RecipientResolutionPlan.model_validate(plan_data)
+            flow = _resolve_recipient_from_plan(flow, user_id, plan)
+
+        # Step B: Determine next step based on draft completeness
+        flow, message = _determine_next_step(flow, user_id)
+
+        flow.updated_at = datetime.now()
+        return {
+            "active_flow": serialize_flow(flow),
+            "response_message": message,
+        }
+
+    # ─── CONFIRM ──────────────────────────────────────────────────────
+    if action == "CONFIRM":
+        if not flow:
+            return {"response_message": "Không có giao dịch nào đang chờ xác nhận."}
+
+        if flow.status == "WAITING_RECIPIENT_CONFIRMATION":
+            flow = await _handle_recipient_confirmed(flow, user_id)
+            if flow.status == "CANCELLED":
+                return {
+                    "active_flow": None,
+                    "response_message": TEMPLATES["fraud_block"],
+                }
+            message = _build_draft_summary_message(flow)
+            flow.updated_at = datetime.now()
+
+            write_audit_log(
+                cif_no=user_id,
+                event_type="RECIPIENT_CONFIRMED",
+                actor="user",
+                session_id=session_id,
+                event_payload={"recipient": flow.draft.recipient_name},
+            )
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_message": message,
+            }
+
+        elif flow.status == "WAITING_DRAFT_CONFIRMATION":
+            validation = _validator.validate_for_execution(flow.draft, user_id)
+            if not validation.valid:
+                message = "Không thể thực hiện giao dịch:\n" + "\n".join(
+                    f"• {e}" for e in validation.errors
+                )
+                return {"response_message": message}
+
+            # Create OTP challenge
+            challenge_id = otp_service.create_challenge(
+                flow_id=flow.flow_id,
+                user_id=user_id,
+                summary_hash=flow.draft.summary_hash(),
+            )
+            flow.otp_challenge_id = challenge_id
+            flow.status = "WAITING_OTP"
+            flow.pending_question = PendingQuestion(
+                slot="otp",
+                question="Nhập mã OTP",
+                expected_type="otp",
+            )
+            flow.updated_at = datetime.now()
+
+            message = TEMPLATES["otp_request"].format(
+                amount=f"{flow.draft.amount:,.0f} VND",
+                recipient_name=flow.draft.recipient_name,
+            )
+
+            write_audit_log(
+                cif_no=user_id,
+                event_type="OTP_CHALLENGE_CREATED",
+                actor="system",
+                session_id=session_id,
+                event_payload={"challenge_id": challenge_id},
+            )
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_message": message,
+            }
+
+    # ─── SUBMIT_OTP ───────────────────────────────────────────────────
+    if action == "SUBMIT_OTP":
+        if not flow or not flow.otp_challenge_id:
+            return {"response_message": "Không có giao dịch nào đang chờ OTP."}
+
+        otp_input = decision_data.get("data", {}).get("otp", "")
+        current_hash = flow.draft.summary_hash()
+
+        result = otp_service.validate(
+            challenge_id=flow.otp_challenge_id,
+            otp_input=otp_input,
+            current_summary_hash=current_hash,
+        )
+
+        if result.valid:
+            # Execute transaction
+            flow.draft.idempotency_key = f"{flow.flow_id}:{flow.draft.confirmation_id}"
+            flow.status = "EXECUTING"
+
+            write_audit_log(
+                cif_no=user_id,
+                event_type="OTP_VALIDATED",
+                actor="system",
+                session_id=session_id,
+                event_payload={"success": True},
+            )
+
+            exec_result = await _execute_transaction(flow, user_id, session_id)
+            flow.status = "COMPLETED"
+            flow.updated_at = datetime.now()
+
+            message = exec_result["message"]
+            if flow.interrupted_intent:
+                message += f"\n\nTiếp theo, tôi sẽ hỗ trợ bạn {_intent_display_name(flow.interrupted_intent.intent)}."
+
+            return {
+                "active_flow": None,
+                "response_message": message,
+                "response_data": exec_result.get("data", {}),
+            }
+        else:
+            # OTP failed
+            flow.otp_attempts += 1
+            flow.updated_at = datetime.now()
+
+            write_audit_log(
+                cif_no=user_id,
+                event_type="OTP_FAILED",
+                actor="system",
+                session_id=session_id,
+                event_payload={"reason": result.reason, "attempts": flow.otp_attempts},
+            )
+
+            if result.reason == "expired":
+                return {
+                    "active_flow": None,
+                    "response_message": TEMPLATES["otp_expired"],
+                }
+            elif result.reason == "max_attempts":
+                return {
+                    "active_flow": None,
+                    "response_message": TEMPLATES["otp_max_attempts"],
+                }
+            elif result.reason == "hash_mismatch":
+                return {
+                    "active_flow": None,
+                    "response_message": TEMPLATES["otp_hash_mismatch"],
+                }
+            else:
+                remaining = otp_service.get_remaining_attempts(flow.otp_challenge_id)
+                message = TEMPLATES["otp_wrong"].format(remaining=remaining)
+                return {
+                    "active_flow": serialize_flow(flow),
+                    "response_message": message,
+                }
+
+    # ─── CANCEL_ACTIVE_FLOW ───────────────────────────────────────────
+    if action == "CANCEL_ACTIVE_FLOW":
+        if not flow:
+            return {"response_message": "Không có giao dịch nào để hủy."}
+
+        if flow.otp_challenge_id:
+            otp_service.invalidate(flow.otp_challenge_id)
+
+        write_audit_log(
+            cif_no=user_id,
+            event_type="FLOW_CANCELLED",
+            actor="user",
+            session_id=session_id,
+            event_payload={"flow_id": flow.flow_id, "status_at_cancel": flow.status},
+        )
+
+        return {
+            "active_flow": None,
+            "response_message": TEMPLATES["cancelled"],
+        }
+
+    # ─── INTERRUPT_LOCKED_FLOW ────────────────────────────────────────
+    if action == "INTERRUPT_LOCKED_FLOW":
+        if flow:
+            messages = state["messages"]
+            last_msg = messages[-1].content if messages else ""
+            flow.interrupted_intent = InterruptedIntent(
+                intent=decision_data.get("interrupted_intent", ""),
+                original_message=last_msg,
+            )
+            flow.updated_at = datetime.now()
+
+            message = TEMPLATES["interrupt_locked"].format(
+                amount=f"{flow.draft.amount:,.0f} VND" if flow.draft and flow.draft.amount else "?",
+                recipient_name=flow.draft.recipient_name if flow.draft else "?",
+            )
+            return {
+                "active_flow": serialize_flow(flow),
+                "response_message": message,
+            }
+
+    # ─── ASK_VALID_INPUT ──────────────────────────────────────────────
+    if action == "ASK_VALID_INPUT":
+        if flow and flow.status == "WAITING_OTP":
+            return {"response_message": TEMPLATES["ask_valid_otp"]}
+        elif flow and flow.status in (
+            "WAITING_RECIPIENT_CONFIRMATION",
+            "WAITING_DRAFT_CONFIRMATION",
+        ):
+            return {"response_message": TEMPLATES["ask_confirm_or_cancel"]}
+        return {"response_message": "Tôi chưa hiểu rõ. Vui lòng thử lại."}
+
+    return {}
 
 
-def route_after_confirmation(state: ChatState) -> str:
-    """Route after confirmation classification."""
-    fsm = state.get("fsm_state", "idle")
-    status = state.get("response_status", "")
-    if fsm == "waiting_otp":
-        return END  # Response already set, wait for next input
-    elif status == "side_question":
-        return "classify_intent"  # Handle side question while keeping draft
-    elif status == "clarification_needed":
-        return END  # Ask again
-    else:
-        return END  # Cancelled or other
+# ─── Node: format_response_node ──────────────────────────────────────────────
 
 
-def route_after_otp(state: ChatState) -> str:
-    """Route after OTP validation."""
-    fsm = state.get("fsm_state", "")
-    if fsm in ("executed", "waiting_category_confirm"):
-        return END  # Response includes category question or execution done
-    else:
-        return END  # Failed OTP, ask again
+async def format_response_node(state: ChatState) -> dict:
+    """Final formatting — ensure response_message is always set."""
+    message = state.get("response_message", "")
+    if not message:
+        message = "Tôi có thể giúp gì cho bạn?"
+    return {"response_message": message}
+
+
+# ─── Routing function ─────────────────────────────────────────────────────────
+
+
+def after_route(state: ChatState) -> str:
+    """Route after route_node — decide if we need agent or can handle directly."""
+    decision_data = state.get("route_decision", {})
+    action = decision_data.get("action", "")
+
+    # Actions that need agent processing
+    if action in ("CLASSIFY_NEW_INTENT", "CONTINUE_COLLECTING", "MODIFY_DRAFT", "ANSWER_PENDING_QUESTION"):
+        return "dispatch_agent"
+
+    # Actions that handle_flow_action can handle directly
+    if action in (
+        "CONFIRM",
+        "CANCEL_ACTIVE_FLOW",
+        "SUBMIT_OTP",
+        "INTERRUPT_LOCKED_FLOW",
+        "ASK_VALID_INPUT",
+    ):
+        return "handle_flow_action"
+
+    # Default: respond directly
+    return "respond"
 
 
 # ─── Build the graph ──────────────────────────────────────────────────────────
 
+
 def build_orchestrator_graph() -> StateGraph:
-    """Build the main orchestrator StateGraph."""
+    """Build the main orchestrator StateGraph.
+
+    Graph structure:
+      route → [dispatch_agent → handle_flow_action → format_response]
+            → [handle_flow_action → format_response]
+            → [format_response]
+    """
     graph = StateGraph(ChatState)
 
-    # Add nodes
-    graph.add_node("entry", entry_node)
-    graph.add_node("classify_intent", classify_intent_node)
-    graph.add_node("transaction_agent", transaction_agent_node)
-    graph.add_node("bill_agent", bill_agent_node)
-    graph.add_node("topup_agent", topup_agent_node)
-    graph.add_node("card_agent", card_agent_node)
-    graph.add_node("account_agent", account_agent_node)
-    graph.add_node("fraud_agent", fraud_agent_node)
-    graph.add_node("qa_agent", qa_agent_node)
-    graph.add_node("data_query_agent", data_query_agent_node)
-    graph.add_node("finance_agent", finance_agent_node)
-    graph.add_node("guardrails", guardrails_node)
-    graph.add_node("confirmation", confirmation_node)
-    graph.add_node("otp", otp_node)
-    graph.add_node("category_confirm", category_confirm_node)
+    graph.add_node("route", route_node)
+    graph.add_node("dispatch_agent", dispatch_agent_node)
+    graph.add_node("handle_flow_action", handle_flow_action_node)
+    graph.add_node("format_response", format_response_node)
 
-    # Entry point — check FSM state first
-    graph.set_entry_point("entry")
+    graph.set_entry_point("route")
 
-    # Entry dispatches based on FSM state
     graph.add_conditional_edges(
-        "entry",
-        route_by_fsm_state,
+        "route",
+        after_route,
         {
-            "classify_intent": "classify_intent",
-            "confirmation": "confirmation",
-            "otp": "otp",
-            "category_confirm": "category_confirm",
+            "dispatch_agent": "dispatch_agent",
+            "handle_flow_action": "handle_flow_action",
+            "respond": "format_response",
         },
     )
 
-    # After intent classification, route to domain agent
-    graph.add_conditional_edges(
-        "classify_intent",
-        route_by_intent,
-        {
-            "transaction_agent": "transaction_agent",
-            "bill_agent": "bill_agent",
-            "topup_agent": "topup_agent",
-            "card_agent": "card_agent",
-            "account_agent": "account_agent",
-            "fraud_agent": "fraud_agent",
-            "qa_agent": "qa_agent",
-            "data_query_agent": "data_query_agent",
-            "finance_agent": "finance_agent",
-        },
-    )
-
-    # After domain agents, check if we need guardrails
-    graph.add_conditional_edges("transaction_agent", route_after_agent, {"guardrails": "guardrails", END: END})
-    graph.add_conditional_edges("bill_agent", route_after_agent, {"guardrails": "guardrails", END: END})
-    graph.add_conditional_edges("topup_agent", route_after_agent, {"guardrails": "guardrails", END: END})
-    graph.add_conditional_edges("card_agent", route_after_agent, {"guardrails": "guardrails", END: END})
-    graph.add_conditional_edges("account_agent", route_after_agent, {"guardrails": "guardrails", END: END})
-    graph.add_edge("fraud_agent", END)
-    graph.add_edge("qa_agent", END)
-    graph.add_edge("data_query_agent", END)
-    graph.add_edge("finance_agent", END)
-
-    # Guardrails → END (sets FSM state for next invocation)
-    graph.add_edge("guardrails", END)
-
-    # Confirmation → END or side_question → classify_intent
-    graph.add_conditional_edges(
-        "confirmation",
-        route_after_confirmation,
-        {END: END, "classify_intent": "classify_intent"},
-    )
-
-    # OTP → END
-    graph.add_conditional_edges("otp", route_after_otp, {END: END})
-
-    # Category confirm → END
-    graph.add_edge("category_confirm", END)
+    graph.add_edge("dispatch_agent", "handle_flow_action")
+    graph.add_edge("handle_flow_action", "format_response")
+    graph.add_edge("format_response", END)
 
     return graph
 
 
-def _create_checkpointer():
-    """Create an async-compatible runtime checkpointer.
+# ─── Checkpointer ────────────────────────────────────────────────────────────
 
-    The async graph runtime calls async checkpoint APIs. The synchronous
-    PostgresSaver can set up tables, but cannot be returned to ainvoke().
-    """
-    try:
-        from langgraph.checkpoint.postgres import PostgresSaver
-        from backend.config import DATABASE_URL
-        import psycopg
-
-        setup_conn = psycopg.connect(DATABASE_URL, autocommit=True)
-        try:
-            saver = PostgresSaver(setup_conn)
-            saver.setup()
-            logger.info("[CHECKPOINT] PostgreSQL tables ready")
-        finally:
-            setup_conn.close()
-    except Exception as e:
-        logger.warning(f"[CHECKPOINT] Failed to setup PostgreSQL tables: {e}")
-
-    from langgraph.checkpoint.memory import MemorySaver
-    logger.info("[CHECKPOINT] Using MemorySaver runtime; task state is stored in conversation_tasks")
-    return MemorySaver()
-
-
-# Module-level checkpointer (singleton)
 _checkpointer = None
 
 
-def get_checkpointer():
-    """Get or create the checkpointer singleton."""
+async def _create_checkpointer_async():
+    """Create async PostgreSQL-backed checkpointer.
+
+    Falls back to MemorySaver if PostgreSQL connection fails.
+    """
+    from backend.config import DATABASE_URL
+
+    try:
+        import psycopg
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        conn = await psycopg.AsyncConnection.connect(DATABASE_URL, autocommit=True)
+        checkpointer = AsyncPostgresSaver(conn)
+        await checkpointer.setup()
+        logger.info("[CHECKPOINT] AsyncPostgresSaver initialized (durable)")
+        return checkpointer
+    except Exception as e:
+        logger.warning(
+            f"[CHECKPOINT] AsyncPostgresSaver failed ({e}), falling back to MemorySaver"
+        )
+        from langgraph.checkpoint.memory import MemorySaver
+
+        return MemorySaver()
+
+
+async def get_checkpointer():
+    """Get or create the checkpointer singleton (async)."""
     global _checkpointer
     if _checkpointer is None:
-        _checkpointer = _create_checkpointer()
+        _checkpointer = await _create_checkpointer_async()
     return _checkpointer
 
 
-def compile_orchestrator():
-    """Compile the orchestrator graph with checkpointing."""
+async def compile_orchestrator():
+    """Compile the orchestrator graph with async checkpointing."""
     graph = build_orchestrator_graph()
-    checkpointer = get_checkpointer()
+    checkpointer = await get_checkpointer()
     return graph.compile(checkpointer=checkpointer)
 
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
 
-def _messages_to_history(messages: list) -> list[dict]:
-    """Convert LangChain messages to simple history dicts."""
-    history = []
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-            history.append({"role": "user", "message": msg.content})
-        elif isinstance(msg, AIMessage):
-            history.append({"role": "assistant", "message": msg.content})
-    return history
+
+def _apply_extraction_to_flow(flow: FlowState, result) -> FlowState:
+    """Apply extractor result to flow draft."""
+    if not flow.draft:
+        flow.draft = TransactionDraft()
+
+    fields = result.extracted_fields or {}
+
+    if fields.get("amount") is not None:
+        flow.draft.amount = fields["amount"]
+    if fields.get("recipient_query"):
+        flow.draft.recipient_query = fields["recipient_query"]
+    if fields.get("recipient_account_no"):
+        flow.draft.recipient_account_no = fields["recipient_account_no"]
+    if fields.get("recipient_bank_name"):
+        flow.draft.recipient_bank_name = fields["recipient_bank_name"]
+    if fields.get("recipient_bank_code"):
+        flow.draft.recipient_bank_code = fields["recipient_bank_code"]
+    if fields.get("transfer_note"):
+        flow.draft.transfer_note = fields["transfer_note"]
+
+    return flow
 
 
-def _format_success_message(draft: dict) -> str:
-    """Format transaction success message."""
-    amount = draft.get("amount", 0)
-    recipient = draft.get("recipient_name", "")
-    bank = draft.get("bank_name", "")
-    return (
-        f"✅ Giao dịch thành công! Đã chuyển {amount:,.0f} VND cho {recipient} tại {bank}."
+def _resolve_recipient_from_plan(
+    flow: FlowState, user_id: str, plan: RecipientResolutionPlan
+) -> FlowState:
+    """Call RecipientResolver based on structured RecipientResolutionPlan."""
+    if not flow.draft:
+        return flow
+
+    result = _recipient_resolver.resolve_from_plan(user_id, plan)
+
+    # For direct_account with empty constraints, fallback to draft fields
+    if plan.target == "direct_account" and not result.candidates:
+        if flow.draft.recipient_account_no and flow.draft.recipient_bank_code:
+            candidate = _recipient_resolver.find_by_account_no(
+                flow.draft.recipient_account_no, flow.draft.recipient_bank_code
+            )
+            if candidate:
+                result.candidates = [candidate]
+
+    # For saved_beneficiary with empty constraints, fallback to recipient_query
+    if plan.target == "saved_beneficiary" and not result.candidates:
+        query = flow.draft.recipient_query
+        if query:
+            result.candidates = _recipient_resolver.find_by_name(user_id, query)
+
+    # Apply copied fields (amount/note from past transaction)
+    if result.copied_fields:
+        if result.copied_fields.get("amount"):
+            flow.draft.amount = result.copied_fields["amount"]
+        if result.copied_fields.get("note"):
+            flow.draft.transfer_note = result.copied_fields["note"]
+
+    candidates = result.candidates
+
+    if len(candidates) == 1:
+        c = candidates[0]
+        flow.draft.recipient_id = c.beneficiary_id
+        flow.draft.recipient_name = c.name
+        flow.draft.recipient_account_no = c.account_no
+        flow.draft.recipient_account_no_masked = c.account_no_masked
+        flow.draft.recipient_bank_code = c.bank_code
+        flow.draft.recipient_bank_name = c.bank_name
+    elif len(candidates) > 1:
+        flow.pending_question = PendingQuestion(
+            slot="recipient_choice",
+            question=f"Tìm thấy {len(candidates)} người",
+            expected_type="recipient_choice",
+            options=[
+                {
+                    "beneficiary_id": c.beneficiary_id,
+                    "name": c.name,
+                    "account_no": c.account_no,
+                    "account_no_masked": c.account_no_masked,
+                    "bank_code": c.bank_code,
+                    "bank_name": c.bank_name,
+                }
+                for c in candidates
+            ],
+        )
+
+    return flow
+
+
+def _determine_next_step(flow: FlowState, user_id: str) -> tuple[FlowState, str]:
+    """Determine the next step based on draft completeness."""
+    if not flow.draft:
+        return flow, "Hiện tôi chỉ hỗ trợ chuyển tiền trong bản demo này."
+
+    draft = flow.draft
+
+    # If pending question already set by resolver, format it
+    if flow.pending_question and flow.pending_question.slot == "recipient_choice":
+        options = flow.pending_question.options or []
+        candidates_list = "\n".join(
+            f"  {i + 1}. {opt['name']} — {opt['bank_name']} — {opt['account_no_masked']}"
+            for i, opt in enumerate(options)
+        )
+        message = TEMPLATES["recipient_candidates"].format(
+            count=len(options),
+            query=draft.recipient_query or "?",
+            candidates_list=candidates_list,
+        )
+        flow.status = "COLLECTING"
+        return flow, message
+
+    # No recipient at all?
+    if not draft.recipient_account_no and not draft.recipient_name:
+        if draft.recipient_query:
+            message = TEMPLATES["recipient_not_found"].format(query=draft.recipient_query)
+        else:
+            message = TEMPLATES["need_recipient"]
+
+        flow.pending_question = PendingQuestion(
+            slot="recipient_query",
+            question=message,
+            expected_type="text",
+        )
+        flow.status = "COLLECTING"
+        return flow, message
+
+    # No amount?
+    if not draft.amount:
+        message = TEMPLATES["need_amount"]
+        flow.pending_question = PendingQuestion(
+            slot="amount",
+            question=message,
+            expected_type="amount",
+        )
+        flow.status = "COLLECTING"
+        return flow, message
+
+    # Have recipient (account or name) + amount → ask recipient confirmation
+    if draft.recipient_account_no and not draft.recipient_verified:
+        # If we have account but no name yet, show what we have
+        display_name = draft.recipient_name or draft.recipient_account_no
+        flow.status = "WAITING_RECIPIENT_CONFIRMATION"
+        flow.pending_question = PendingQuestion(
+            slot="recipient_confirmation",
+            question="Xác nhận người nhận",
+            expected_type="enum",
+            options=[{"value": "confirm"}, {"value": "cancel"}],
+        )
+        message = TEMPLATES["recipient_confirm"].format(
+            name=display_name,
+            bank=draft.recipient_bank_name or draft.recipient_bank_code or "?",
+            masked_account=draft.recipient_account_no_masked or _mask_account(draft.recipient_account_no),
+        )
+        return flow, message
+
+    # Already verified
+    if draft.recipient_verified and draft.amount:
+        return flow, _build_draft_summary_message(flow)
+
+    return flow, "Đang xử lý..."
+
+
+async def _handle_recipient_confirmed(flow: FlowState, user_id: str) -> FlowState:
+    """After user confirms recipient: verify, fraud check, compute fee."""
+    draft = flow.draft
+
+    # Verify via banking API
+    verification = _recipient_resolver.verify_recipient(
+        draft.recipient_account_no, draft.recipient_bank_code
     )
 
+    if verification.get("status") == "success":
+        draft.recipient_verified = True
+        draft.recipient_name = verification.get("resolved_name", draft.recipient_name)
+        draft.transaction_type = (
+            "INTERNAL_TRANSFER"
+            if verification.get("transfer_type") == "intrabank"
+            else "INTERBANK_TRANSFER"
+        )
+    else:
+        draft.recipient_verified = False
+        flow.status = "COLLECTING"
+        flow.pending_question = PendingQuestion(
+            slot="recipient_query",
+            question="Không thể xác minh tài khoản. Vui lòng kiểm tra lại.",
+            expected_type="text",
+        )
+        return flow
 
-def _looks_like_new_intent(message: str) -> bool:
-    """Heuristic: does this message look like a new question rather than a confirmation reply?
+    # Fraud screening
+    fraud = _recipient_resolver.check_fraud_risk(
+        draft.recipient_account_no, draft.recipient_bank_code
+    )
+    draft.fraud_screening = fraud
 
-    Short replies (1-3 words) are likely confirmation attempts.
-    Longer messages or those containing question marks are likely side questions.
-    """
-    msg = message.strip()
-    word_count = len(msg.split())
-    if word_count <= 3:
-        return False
-    if "?" in msg or "không" in msg.lower() and word_count > 5:
-        return True
-    if word_count >= 6:
-        return True
-    return False
+    if fraud.get("risk_level") == "CRITICAL":
+        flow.status = "CANCELLED"
+        return flow
+
+    # Source account
+    source = _get_primary_account(user_id)
+    if source:
+        draft.source_account_no = source["account_no"]
+        draft.source_account_no_masked = _mask_account(source["account_no"])
+
+    # Fee
+    if draft.transaction_type == "INTERBANK_TRANSFER":
+        draft.fee = 5500
+    else:
+        draft.fee = 0
+    draft.total_debit = (draft.amount or 0) + (draft.fee or 0)
+
+    # Confirmation ID
+    draft.confirmation_id = str(uuid.uuid4())
+
+    # Move to draft confirmation
+    flow.status = "WAITING_DRAFT_CONFIRMATION"
+    flow.pending_question = PendingQuestion(
+        slot="draft_confirmation",
+        question="Xác nhận giao dịch",
+        expected_type="enum",
+        options=[{"value": "confirm"}, {"value": "cancel"}],
+    )
+
+    return flow
+
+
+def _build_draft_summary_message(flow: FlowState) -> str:
+    """Build transaction summary for user confirmation."""
+    draft = flow.draft
+    if not draft:
+        return ""
+
+    warning = ""
+    if draft.fraud_screening and draft.fraud_screening.get("is_reported"):
+        risk = draft.fraud_screening.get("risk_level", "LOW")
+        if risk == "HIGH":
+            warning = TEMPLATES["fraud_warning_high"].format(
+                report_count=draft.fraud_screening.get("report_count", 0),
+            ) + "\n\n"
+
+    message = warning + TEMPLATES["draft_summary"].format(
+        source=draft.source_account_no_masked or "?",
+        recipient_name=draft.recipient_name or "?",
+        bank=draft.recipient_bank_name or draft.recipient_bank_code or "?",
+        masked_account=draft.recipient_account_no_masked or "?",
+        amount=f"{draft.amount:,.0f} VND" if draft.amount else "?",
+        fee=f"{draft.fee:,.0f} VND" if draft.fee is not None else "?",
+        total_debit=f"{draft.total_debit:,.0f} VND" if draft.total_debit else "?",
+        note=draft.transfer_note or "Chuyển tiền",
+    )
+    return message
+
+
+async def _execute_transaction(flow: FlowState, user_id: str, session_id: str) -> dict:
+    """Execute the transaction via TransactionExecutor."""
+    from backend.executor.transaction_executor import TransactionExecutor
+
+    draft = flow.draft
+    executor = TransactionExecutor()
+
+    exec_draft = {
+        "account_no": draft.recipient_account_no,
+        "bank_code": draft.recipient_bank_code,
+        "bank_name": draft.recipient_bank_name,
+        "recipient_name": draft.recipient_name,
+        "amount": draft.amount,
+        "transfer_type": "intrabank" if draft.transaction_type == "INTERNAL_TRANSFER" else "interbank",
+        "note": draft.transfer_note or f"Chuyen tien cho {draft.recipient_name}",
+        "action": "TRANSFER_MONEY",
+    }
+
+    result = await executor.execute(
+        draft=exec_draft,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+    if result.success:
+        message = TEMPLATES["success_receipt"].format(
+            ref=result.transaction_ref or "N/A",
+            time=datetime.now().strftime("%d/%m/%Y %H:%M"),
+            source=draft.source_account_no_masked or "?",
+            recipient_name=draft.recipient_name or "?",
+            bank=draft.recipient_bank_name or draft.recipient_bank_code or "?",
+            masked_account=draft.recipient_account_no_masked or "?",
+            amount=f"{draft.amount:,.0f} VND" if draft.amount else "?",
+            fee=f"{draft.fee:,.0f} VND" if draft.fee is not None else "0 VND",
+            total_debit=f"{draft.total_debit:,.0f} VND" if draft.total_debit else "?",
+            balance=f"{result.balance_after:,.0f} VND" if result.balance_after else "?",
+        )
+        return {"message": message, "data": {"executed": True, "ref": result.transaction_ref}}
+    else:
+        return {
+            "message": f"Giao dịch thất bại: {result.message}",
+            "data": {"executed": False, "error": result.error_code},
+        }
+
+
+def _get_primary_account(user_id: str) -> dict | None:
+    """Get user's primary payment account."""
+    import psycopg2
+    from backend.config import DATABASE_URL
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT account_no, balance
+                    FROM accounts
+                    WHERE cif_no = %s AND account_type = 'PAYMENT' AND status = 'ACTIVE'
+                    ORDER BY balance DESC
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return {"account_no": row[0], "balance": row[1]}
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"[ORCHESTRATOR] get_primary_account error: {e}")
+    return None
+
+
+def _intent_display_name(intent: str) -> str:
+    """Map intent code to Vietnamese display name."""
+    names = {
+        "TRANSACTION": "chuyển tiền",
+        "FRAUD_REPORT": "báo cáo lừa đảo",
+        "CARD_OPERATION": "quản lý thẻ",
+        "ACCOUNT_OPERATION": "quản lý tài khoản",
+        "DATA_QUERY": "tra cứu thông tin",
+        "QA": "hỏi đáp",
+        "FINANCE_ADVICE": "tư vấn tài chính",
+    }
+    return names.get(intent, intent.lower())
