@@ -35,6 +35,599 @@ function renderMarkdown(value) {
   return DOMPurify.sanitize(html);
 }
 
+const CHART_COLORS = ["#10b981", "#38bdf8", "#f59e0b", "#ef4444", "#14b8a6", "#f97316"];
+
+function parseMessageData(value) {
+  if (!value) return null;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value === "object") return value;
+  return null;
+}
+
+function extractVisualizationPayload(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+  if (Array.isArray(parsed.visualizations)) return parsed;
+  if (parsed.data && typeof parsed.data === "object" && Array.isArray(parsed.data.visualizations)) {
+    return parsed.data;
+  }
+  return null;
+}
+
+function extractTransferReceipt(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const direct = parsed.receipt;
+  const nested = parsed.data && typeof parsed.data === "object" ? parsed.data.receipt : null;
+  const receipt = (nested && typeof nested === "object" ? nested : direct) || null;
+
+  if (!receipt || receipt.type !== "TRANSFER_SUCCESS") return null;
+
+  return {
+    transaction_ref: String(receipt.transaction_ref || "N/A"),
+    transaction_time: receipt.transaction_time ? String(receipt.transaction_time) : "",
+    amount: toNumber(receipt.amount),
+    recipient_name: String(receipt.recipient_name || "?"),
+    recipient_account_no: String(receipt.recipient_account_no || receipt.recipient_account_no_masked || "?"),
+    recipient_bank: String(receipt.recipient_bank || "?"),
+    service_fee: toNumber(receipt.service_fee),
+    total_debit: toNumber(receipt.total_debit),
+    balance_before: toNumber(receipt.balance_before),
+    balance_after: toNumber(receipt.balance_after),
+  };
+}
+
+function extractCategoryConfirmation(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const flowStatus = String(parsed.flow_status || "");
+  if (flowStatus && flowStatus !== "WAITING_CATEGORY_CONFIRMATION") return null;
+
+  const direct = parsed.category_confirmation;
+  const nested = parsed.data && typeof parsed.data === "object" ? parsed.data.category_confirmation : null;
+  const category = (nested && typeof nested === "object" ? nested : direct) || null;
+
+  if (!category) return null;
+
+  const alternativesRaw = Array.isArray(category.alternatives) ? category.alternatives : [];
+  const alternatives = alternativesRaw
+    .map((item, index) => {
+      if (!item || typeof item !== "object") return null;
+      return {
+        index: Number.isFinite(Number(item.index)) ? Number(item.index) : index + 1,
+        name: String(item.name || `Lựa chọn ${index + 1}`),
+        command: String(item.command || index + 1),
+      };
+    })
+    .filter(Boolean);
+
+  const commands = category.commands && typeof category.commands === "object" ? category.commands : {};
+
+  return {
+    predicted_name: String(category.predicted_name || "Khác"),
+    alternatives,
+    confirm_command: String(commands.confirm || "đúng"),
+    skip_command: String(commands.skip || "bỏ qua"),
+  };
+}
+
+function toNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function compactAxisLabel(value, maxLength = 12) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "N/A";
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(1, maxLength - 1))}…`;
+}
+
+function wrapAxisLabel(value, maxCharsPerLine = 10, maxLines = 4) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return ["N/A"];
+
+  const safeMaxChars = Math.max(4, maxCharsPerLine);
+  const safeMaxLines = Math.max(1, maxLines);
+
+  // Split long words first so wrapping still works without spaces.
+  const words = normalized
+    .split(" ")
+    .flatMap((word) => {
+      if (word.length <= safeMaxChars) return [word];
+      const chunks = [];
+      for (let i = 0; i < word.length; i += safeMaxChars) {
+        chunks.push(word.slice(i, i + safeMaxChars));
+      }
+      return chunks;
+    })
+    .filter(Boolean);
+
+  const lines = [];
+  let current = "";
+
+  for (let idx = 0; idx < words.length; idx += 1) {
+    const word = words[idx];
+    const candidate = current ? `${current} ${word}` : word;
+    if (!current || candidate.length <= safeMaxChars) {
+      current = candidate;
+      continue;
+    }
+
+    lines.push(current);
+    current = word;
+
+    if (lines.length >= safeMaxLines - 1) {
+      const rest = [current, ...words.slice(idx + 1)].join(" ").trim();
+      if (rest) lines.push(rest);
+      return lines.slice(0, safeMaxLines);
+    }
+  }
+
+  if (current) lines.push(current);
+  return lines.slice(0, safeMaxLines);
+}
+
+function formatMetric(value, currency = "VND", unit = null) {
+  const n = toNumber(value);
+  if (unit === "percent") return `${n.toFixed(2)}%`;
+  if (unit === "count") return `${Math.round(n)}`;
+  if (currency === "VND") {
+    return `${new Intl.NumberFormat("vi-VN").format(Math.round(n))} đ`;
+  }
+  return new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 2 }).format(n);
+}
+
+function formatVnd(value) {
+  const amount = toNumber(value);
+  return `${new Intl.NumberFormat("vi-VN").format(Math.round(amount))} VND`;
+}
+
+function formatReceiptTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("vi-VN", {
+    hour12: false,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function estimateYAxisPadding(tickValues, currency, unit, minPadding = 56, maxPadding = 132) {
+  const longest = tickValues.reduce((maxLength, value) => {
+    const size = formatMetric(value, currency, unit).length;
+    return Math.max(maxLength, size);
+  }, 0);
+
+  const estimated = Math.ceil(longest * 6.1 + 18);
+  return Math.max(minPadding, Math.min(maxPadding, estimated));
+}
+
+function normalizeChart(chart) {
+  if (!chart || typeof chart !== "object") return null;
+  const labels = Array.isArray(chart.labels) ? chart.labels.map((item) => String(item)) : [];
+  const series = Array.isArray(chart.series)
+    ? chart.series
+        .map((item) => ({
+          name: String(item?.name || "Series"),
+          values: Array.isArray(item?.values) ? item.values.map(toNumber) : [],
+        }))
+        .filter((item) => item.values.length > 0)
+    : [];
+
+  if (!labels.length || !series.length) return null;
+  return {
+    id: String(chart.id || ""),
+    type: String(chart.type || "bar"),
+    title: String(chart.title || "Biểu đồ"),
+    subtitle: chart.subtitle ? String(chart.subtitle) : "",
+    unit: chart.unit ? String(chart.unit) : null,
+    currency: chart.currency ? String(chart.currency) : "VND",
+    labels,
+    series,
+  };
+}
+
+function ChartLegend({ series }) {
+  return e(
+    "ul",
+    { class: "finance-chart-legend" },
+    series.map((item, index) =>
+      e(
+        "li",
+        { key: `${item.name}-${index}` },
+        e("span", {
+          class: "finance-chart-legend__swatch",
+          style: `background:${CHART_COLORS[index % CHART_COLORS.length]}`,
+        }),
+        e("span", null, item.name),
+      ),
+    ),
+  );
+}
+
+function LineChart({ labels, series, currency, unit }) {
+  const width = 640;
+  const height = 236;
+  const maxValue = Math.max(1, ...series.flatMap((item) => item.values.map(toNumber)));
+  const yTicks = 4;
+  const tickValues = Array.from({ length: yTicks + 1 }, (_, index) => (maxValue / yTicks) * (yTicks - index));
+  const padding = {
+    top: 16,
+    right: 16,
+    bottom: 34,
+    left: estimateYAxisPadding(tickValues, currency, unit, 64, 136),
+  };
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+
+  function x(index) {
+    if (labels.length <= 1) return padding.left + chartWidth / 2;
+    return padding.left + (index * chartWidth) / (labels.length - 1);
+  }
+
+  function y(value) {
+    return padding.top + chartHeight - (toNumber(value) / maxValue) * chartHeight;
+  }
+
+  const paths = series.map((item, seriesIndex) => {
+    const d = item.values
+      .map((value, valueIndex) => `${valueIndex === 0 ? "M" : "L"} ${x(valueIndex)} ${y(value)}`)
+      .join(" ");
+    return e("path", {
+      key: `${item.name}-line`,
+      d,
+      class: "finance-chart-line",
+      style: `stroke:${CHART_COLORS[seriesIndex % CHART_COLORS.length]}`,
+    });
+  });
+
+  return e(
+    "svg",
+    { class: "finance-chart-svg", viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": "line chart" },
+    e(
+      "g",
+      { class: "finance-chart-grid" },
+      tickValues.map((value, index) => {
+        const yPos = padding.top + (chartHeight * index) / yTicks;
+        return e(
+          "g",
+          { key: `y-${index}` },
+          e("line", {
+            x1: padding.left,
+            y1: yPos,
+            x2: width - padding.right,
+            y2: yPos,
+          }),
+          e(
+            "text",
+            {
+              class: "finance-chart-axis-label",
+              x: padding.left - 8,
+              y: yPos + 4,
+              "text-anchor": "end",
+            },
+            formatMetric(value, currency, unit),
+          ),
+        );
+      }),
+    ),
+    paths,
+    series.map((item, seriesIndex) =>
+      item.values.map((value, valueIndex) =>
+        e("circle", {
+          key: `${item.name}-point-${valueIndex}`,
+          class: "finance-chart-point",
+          cx: x(valueIndex),
+          cy: y(value),
+          r: 3.5,
+          style: `fill:${CHART_COLORS[seriesIndex % CHART_COLORS.length]}`,
+        }),
+      ),
+    ),
+    e(
+      "g",
+      { class: "finance-chart-axis" },
+      labels.map((label, index) => {
+        const isFirst = index === 0;
+        const isLast = index === labels.length - 1;
+        const anchor = isFirst ? "start" : isLast ? "end" : "middle";
+        const xPos = x(index) + (isFirst ? 2 : isLast ? -2 : 0);
+        return e(
+          "text",
+          {
+            key: `${label}-${index}`,
+            class: "finance-chart-axis-label",
+            x: xPos,
+            y: height - 12,
+            "text-anchor": anchor,
+          },
+          label,
+        );
+      }),
+    ),
+  );
+}
+
+function BarChart({ labels, series, currency, unit, grouped = false }) {
+  const width = 640;
+  const height = 262;
+  const maxValue = Math.max(1, ...series.flatMap((item) => item.values.map(toNumber)));
+  const yTicks = 4;
+  const tickValues = Array.from({ length: yTicks + 1 }, (_, index) => (maxValue / yTicks) * (yTicks - index));
+  const leftPadding = estimateYAxisPadding(tickValues, currency, unit, 64, 136);
+  const chartWidth = width - leftPadding - 16;
+  const groupCount = labels.length;
+  const groupWidth = groupCount ? chartWidth / groupCount : chartWidth;
+  const labelMaxLength = Math.max(5, Math.min(13, Math.floor(groupWidth / 6.1)));
+  const wrappedLabels = labels.map((label) => wrapAxisLabel(label, labelMaxLength, 4));
+  const maxLabelLines = wrappedLabels.reduce((maxLines, lines) => Math.max(maxLines, lines.length), 1);
+  const labelLineHeight = 11;
+  const labelBlockHeight = maxLabelLines * labelLineHeight;
+  const padding = {
+    top: 16,
+    right: 16,
+    bottom: Math.max(44, labelBlockHeight + 24),
+    left: leftPadding,
+  };
+  const chartHeight = height - padding.top - padding.bottom;
+
+  function y(value) {
+    return padding.top + chartHeight - (toNumber(value) / maxValue) * chartHeight;
+  }
+
+  const seriesCount = grouped ? series.length : 1;
+  const barArea = groupWidth * 0.74;
+  const barWidth = Math.max(8, Math.min(34, barArea / Math.max(seriesCount, 1)));
+  const labelY = padding.top + chartHeight + 14;
+
+  const bars = labels.flatMap((_, labelIndex) => {
+    const items = grouped ? series : [series[0]];
+    return items.map((item, seriesIndex) => {
+      const value = toNumber(item.values[labelIndex]);
+      const baseX = padding.left + labelIndex * groupWidth + (groupWidth - barArea) / 2;
+      const x = baseX + seriesIndex * barWidth;
+      const yPos = y(value);
+      return e("rect", {
+        key: `${item.name}-${labelIndex}-${seriesIndex}`,
+        class: "finance-chart-bar",
+        x,
+        y: yPos,
+        width: Math.max(2, barWidth - 1.5),
+        height: Math.max(1, padding.top + chartHeight - yPos),
+        rx: 3,
+        ry: 3,
+        style: `fill:${CHART_COLORS[seriesIndex % CHART_COLORS.length]}`,
+      });
+    });
+  });
+
+  return e(
+    "svg",
+    { class: "finance-chart-svg", viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": "bar chart" },
+    e(
+      "g",
+      { class: "finance-chart-grid" },
+      tickValues.map((value, index) => {
+        const yPos = padding.top + (chartHeight * index) / yTicks;
+        return e(
+          "g",
+          { key: `bar-y-${index}` },
+          e("line", {
+            x1: padding.left,
+            y1: yPos,
+            x2: width - padding.right,
+            y2: yPos,
+          }),
+          e(
+            "text",
+            {
+              class: "finance-chart-axis-label",
+              x: padding.left - 8,
+              y: yPos + 4,
+                "text-anchor": "end",
+            },
+            formatMetric(value, currency, unit),
+          ),
+        );
+      }),
+    ),
+    bars,
+    e(
+      "g",
+      { class: "finance-chart-axis" },
+      labels.map((label, index) => {
+        const xPos = padding.left + index * groupWidth + groupWidth / 2;
+        const lines = wrappedLabels[index] || [String(label || "")];
+
+        return e(
+          "text",
+          {
+            key: `${label}-${index}`,
+            class: "finance-chart-axis-label finance-chart-axis-label--multiline",
+            x: xPos,
+            y: labelY,
+            "text-anchor": "middle",
+          },
+          lines.map((line, lineIndex) =>
+            e(
+              "tspan",
+              {
+                key: `${label}-${index}-line-${lineIndex}`,
+                x: xPos,
+                dy: lineIndex === 0 ? 0 : labelLineHeight,
+              },
+              line,
+            ),
+          ),
+        );
+      }),
+    ),
+  );
+}
+
+function FinanceChart({ chart, fallbackCurrency }) {
+  const currency = chart.currency || fallbackCurrency || "VND";
+  if (chart.type === "line") {
+    return e(LineChart, { labels: chart.labels, series: chart.series, currency, unit: chart.unit });
+  }
+  if (chart.type === "bar-grouped") {
+    return e(BarChart, {
+      labels: chart.labels,
+      series: chart.series,
+      currency,
+      unit: chart.unit,
+      grouped: true,
+    });
+  }
+  if (chart.type === "bar") {
+    return e(BarChart, {
+      labels: chart.labels,
+      series: chart.series,
+      currency,
+      unit: chart.unit,
+      grouped: false,
+    });
+  }
+  return e("p", { class: "finance-chart-empty" }, "Biểu đồ chưa được hỗ trợ.");
+}
+
+function FinanceVisualizations({ visualizations, currency = "VND" }) {
+  const charts = (visualizations || []).map(normalizeChart).filter(Boolean);
+  if (!charts.length) return null;
+
+  return e(
+    "section",
+    { class: "message-visualizations" },
+    charts.map((chart, index) =>
+      e(
+        "article",
+        { key: chart.id || `${chart.type}-${index}`, class: "finance-chart-card" },
+        e(
+          "div",
+          { class: "finance-chart-card__header" },
+          e("h4", { class: "finance-chart-card__title" }, chart.title),
+          chart.subtitle ? e("p", { class: "finance-chart-card__subtitle" }, chart.subtitle) : null,
+        ),
+        e(FinanceChart, { chart, fallbackCurrency: currency }),
+        chart.series.length > 1 ? e(ChartLegend, { series: chart.series }) : null,
+      ),
+    ),
+  );
+}
+
+function TransactionReceiptCard({ receipt }) {
+  const rows = [
+    { label: "Số tiền", value: formatVnd(receipt.amount) },
+    { label: "Người nhận", value: receipt.recipient_name },
+    { label: "Số tài khoản", value: receipt.recipient_account_no },
+    { label: "Ngân hàng", value: receipt.recipient_bank },
+    { label: "Phí dịch vụ", value: formatVnd(receipt.service_fee) },
+    { label: "Tổng tiền bị trừ", value: formatVnd(receipt.total_debit) },
+    { label: "Số dư trước giao dịch", value: formatVnd(receipt.balance_before) },
+    { label: "Số dư sau giao dịch", value: formatVnd(receipt.balance_after) },
+  ];
+
+  const formattedTime = formatReceiptTime(receipt.transaction_time);
+
+  return e(
+    "section",
+    { class: "transaction-receipt-card" },
+    e(
+      "div",
+      { class: "transaction-receipt-card__header" },
+      e("div", { class: "transaction-receipt-card__icon" }, e(Check, { size: 16 })),
+      e(
+        "div",
+        { class: "transaction-receipt-card__headline" },
+        e(
+          "h4",
+          null,
+          "Hệ thống ghi nhận yêu cầu. Tài khoản đã thực hiện giao dịch thành công!",
+        ),
+        e(
+          "p",
+          null,
+          `Mã giao dịch: ${receipt.transaction_ref}`,
+          formattedTime ? ` · ${formattedTime}` : "",
+        ),
+      ),
+    ),
+    e(
+      "dl",
+      { class: "transaction-receipt-card__grid" },
+      rows.map((item) =>
+        e(
+          "div",
+          { key: item.label, class: "transaction-receipt-card__row" },
+          e("dt", null, item.label),
+          e("dd", null, item.value),
+        ),
+      ),
+    ),
+  );
+}
+
+function CategoryChoiceButtons({ categoryConfirmation, onQuickReply, disabled = false }) {
+  if (!categoryConfirmation || typeof onQuickReply !== "function") return null;
+
+  return e(
+    "section",
+    { class: "category-actions" },
+    e(
+      "p",
+      { class: "category-actions__hint" },
+      "Chọn loại giao dịch (nếu bạn không chọn và gửi yêu cầu mới, hệ thống sẽ lưu giá trị dự đoán mặc định).",
+    ),
+    e(
+      "div",
+      { class: "category-actions__row" },
+      e(
+        "button",
+        {
+          type: "button",
+          class: "category-action-btn primary",
+          onClick: () => onQuickReply(categoryConfirmation.confirm_command),
+          disabled,
+        },
+        `Giữ: ${categoryConfirmation.predicted_name}`,
+      ),
+      categoryConfirmation.alternatives.map((item) =>
+        e(
+          "button",
+          {
+            key: `${item.index}-${item.name}`,
+            type: "button",
+            class: "category-action-btn",
+            onClick: () => onQuickReply(item.command),
+            disabled,
+          },
+          `${item.index}. ${item.name}`,
+        ),
+      ),
+      e(
+        "button",
+        {
+          type: "button",
+          class: "category-action-btn skip",
+          onClick: () => onQuickReply(categoryConfirmation.skip_command),
+          disabled,
+        },
+        "Bỏ qua",
+      ),
+    ),
+  );
+}
+
 function IconButton({ title, onClick, children, kind = "ghost", disabled = false }) {
   return e(
     "button",
@@ -185,9 +778,14 @@ function Topbar({ session, title, setTitle, onRename, onDelete, loading = false,
   );
 }
 
-function MessageBubble({ message }) {
+function MessageBubble({ message, isLatest = false, onQuickReply, quickReplyDisabled = false }) {
   const isUser = message.role === "user";
-  const payload = message.data ? JSON.stringify(message.data, null, 2) : null;
+  const parsedData = parseMessageData(message.data);
+  const vizPayload = extractVisualizationPayload(parsedData);
+  const transferReceipt = extractTransferReceipt(parsedData);
+  const categoryConfirmation = extractCategoryConfirmation(parsedData);
+  const visualizations = Array.isArray(vizPayload?.visualizations) ? vizPayload.visualizations : [];
+  const payload = parsedData ? JSON.stringify(parsedData, null, 2) : message.data ? String(message.data) : null;
   return e(
     "article",
     { class: `message ${isUser ? "user" : "assistant"} ${message.pending ? "pending" : ""}` },
@@ -204,11 +802,22 @@ function MessageBubble({ message }) {
           class: "message-text",
           dangerouslySetInnerHTML: { __html: renderMarkdown(message.message) },
         }),
+    !isUser && !message.pending && transferReceipt ? e(TransactionReceiptCard, { receipt: transferReceipt }) : null,
+    !isUser && !message.pending && isLatest && categoryConfirmation
+      ? e(CategoryChoiceButtons, {
+          categoryConfirmation,
+          onQuickReply,
+          disabled: quickReplyDisabled,
+        })
+      : null,
+    !isUser && !message.pending && visualizations.length
+      ? e(FinanceVisualizations, { visualizations, currency: vizPayload?.currency || "VND" })
+      : null,
     payload ? e("details", null, e("summary", null, "Response data"), e("pre", null, payload)) : null,
   );
 }
 
-function MessageList({ messages, activeSessionId, loading = false }) {
+function MessageList({ messages, activeSessionId, loading = false, onQuickReply, quickReplyDisabled = false }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
@@ -229,7 +838,15 @@ function MessageList({ messages, activeSessionId, loading = false }) {
           )
       : messages.length === 0
         ? e("div", { class: "empty-state" }, e(Bot, { size: 34 }), e("h3", null, "Start the conversation"))
-        : messages.map((message) => e(MessageBubble, { key: message.id || `${message.role}-${message.created_at}`, message })),
+        : messages.map((message, index) =>
+            e(MessageBubble, {
+              key: message.id || `${message.role}-${message.created_at}`,
+              message,
+              isLatest: index === messages.length - 1,
+              onQuickReply,
+              quickReplyDisabled,
+            }),
+          ),
   );
 }
 
@@ -563,7 +1180,13 @@ function App() {
         saving: busyAction === "save" || busyAction === "delete",
       }),
       error ? e("div", { class: "error-banner" }, error) : null,
-      e(MessageList, { messages, activeSessionId, loading: isSessionLoading }),
+      e(MessageList, {
+        messages,
+        activeSessionId,
+        loading: isSessionLoading,
+        onQuickReply: handleSend,
+        quickReplyDisabled: !canSend || busyAction === "send",
+      }),
       e(Composer, { disabled: !canSend || busyAction === "send", onSend: handleSend, loading: busyAction === "send" }),
     ),
   );

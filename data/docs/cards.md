@@ -1,94 +1,54 @@
 # cards
 
-## 1. Mục đích bảng
+## 1. Muc dich bang
 
-Lưu thông tin thẻ ngân hàng (debit/credit) của khách hàng. Agent dùng bảng này để resolve thẻ khi user yêu cầu khóa/mở thẻ, thay đổi hạn mức, hoặc tra cứu giao dịch thẻ.
+Luu thong tin the de xu ly khoa/mo khoa/bao mat va xem thong tin the.
 
-**Nhóm:** Master/reference data
+**Nhom:** Master/reference data
 
-## 2. Ngữ cảnh nghiệp vụ
+## 2. Ngu canh nghiep vu
 
-- Bảng này tồn tại để agent biết khách hàng có những thẻ nào, trạng thái thẻ ra sao.
-- Agent dùng bảng này để:
-  - Resolve `card_id` khi user nói "khóa thẻ visa" hoặc "thẻ credit".
-  - Kiểm tra hạn mức thẻ tín dụng (`credit_limit`, `available_limit`).
-  - Xác định thẻ liên kết với tài khoản nào (`account_no`).
-- Phục vụ use case: khóa/mở thẻ (CARD_LOCK/CARD_UNLOCK), thay đổi hạn mức (CARD_LIMIT_CHANGE), tra cứu giao dịch thẻ.
-- Bảng này **không lưu** lịch sử giao dịch thẻ (xem `transactions` với `card_id`).
-- `masked_card_no` dùng để hiển thị cho user (không lộ số thẻ đầy đủ).
+- Bang nay phuc vu luong xu ly cua cac agent trong he thong TrustFlow.
+- Du lieu duoc dung de truy van read model, xac thuc thong tin va truy vet audit.
+- Day la mock data cho demo, khong phai core ledger van hanh that.
 
 ## 3. Columns
 
 | Column | Type | Meaning | Example Values From Data | Nullable | Key / Relationship | Notes |
 |---|---|---|---|---|---|---|
-| card_id | UUID string | ID kỹ thuật thẻ | `5943f137-22d2-5650-b80e-98c1cfb2031c` | No | PK | Dùng trong API payload khi khóa/mở thẻ |
-| cif_no | string | Mã khách hàng sở hữu thẻ | `CIF000081`, `CIF000066`, `CIF000006` | No | FK → customers.cif_no | Filter thẻ theo khách hàng |
-| account_no | string | Số tài khoản liên kết | `25579415521`, `92644220969`, `4124782613` | No | FK → accounts.account_no | Thẻ debit liên kết tài khoản thanh toán, credit liên kết settlement |
-| masked_card_no | string | Số thẻ đã mask | `**** **** **** 7069`, `**** **** **** 7899` | Yes | - | Hiển thị cho user để nhận diện thẻ |
-| card_type | enum string | Loại thẻ | `DEBIT`, `CREDIT` | Yes | - | Thẻ ghi nợ hoặc tín dụng |
-| card_network | enum string | Mạng thẻ | `VISA`, `MASTERCARD`, `NAPAS` | Yes | - | Dùng khi user nói "thẻ visa", "thẻ mastercard" |
-| credit_limit | numeric | Hạn mức tín dụng | `178121391` | Yes | - | Chỉ có giá trị với thẻ CREDIT |
-| available_limit | numeric | Hạn mức khả dụng còn lại | `157240687` | Yes | - | Chỉ có giá trị với thẻ CREDIT |
-| status | enum string | Trạng thái thẻ | `ACTIVE`, `LOCKED`, `EXPIRED` | Yes | - | Agent cần check trước khi thực hiện action |
-| issued_at | timestamp string | Ngày phát hành thẻ | `2025-09-01 00:59:29`, `2025-11-11 23:20:27` | Yes | - | - |
+| card_id | UUID string | Dinh danh ban ghi | 5943f137-22d2-5650-b80e-98c1cfb2031c, aef534b2-eb28-5b1e-b26a-d25cc412c438, 988b3f7b-ff84-50b8-ba7e-08520072e350 | No | PK | - |
+| cif_no | string | Ma/so nghiep vu | CIF000013, CIF000013, CIF000067 | No | FK -> customers.cif_no | - |
+| account_no | numeric | Ma/so nghiep vu | 8299229959, 8299229959, 9010016761 | No | FK -> accounts.account_no | - |
+| masked_card_no | string | Ma/so nghiep vu | **** **** **** 7187, **** **** **** 7168, **** **** **** 5303 | No | - | - |
+| card_type | enum string | Truong du lieu nghiep vu | CREDIT, DEBIT, CREDIT | No | - | - |
+| card_network | enum string | Truong du lieu nghiep vu | VISA, MASTERCARD, VISA | No | - | - |
+| credit_limit | numeric | Gia tri tai chinh | 121406577, 180706923, 141890899 | Yes | - | - |
+| available_limit | numeric | Truong du lieu nghiep vu | 74652964, 171433839, 56817641 | Yes | - | - |
+| status | enum string | Trang thai/muc do theo workflow | ACTIVE, ACTIVE, ACTIVE | No | - | Gia tri phai khop enum cua workflow hien tai |
+| issued_at | timestamp string | Moc thoi gian | 2023-08-01 08:14:22, 2025-10-28 08:10:19, 2023-09-15 23:54:18 | No | - | - |
 
 ## 4. Important Values / Enums
 
 | Column | Value | Meaning | Example Use Case |
 |---|---|---|---|
-| card_type | DEBIT | Thẻ ghi nợ | Giao dịch trừ trực tiếp từ tài khoản |
-| card_type | CREDIT | Thẻ tín dụng | Giao dịch dùng hạn mức, trả sau |
-| card_network | VISA | Mạng VISA quốc tế | User nói "khóa thẻ visa" |
-| card_network | MASTERCARD | Mạng Mastercard quốc tế | User nói "thẻ mastercard" |
-| card_network | NAPAS | Mạng nội địa NAPAS | Thẻ ATM nội địa |
-| status | ACTIVE | Thẻ đang hoạt động | Cho phép giao dịch, có thể khóa |
-| status | LOCKED | Thẻ đã khóa | Có thể mở khóa |
-| status | EXPIRED | Thẻ hết hạn | Không thể sử dụng |
+| card_type | CREDIT | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| card_type | DEBIT | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| card_network | MASTERCARD | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| card_network | NAPAS | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| card_network | VISA | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | ACTIVE | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | EXPIRED | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | LOST | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | TEMP_LOCKED | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
 
 ## 5. Relationships
 
-- `cards.cif_no` → `customers.cif_no`
-- `cards.account_no` → `accounts.account_no`
-- `cards.card_id` được tham chiếu bởi `transactions.card_id`
+- cards.cif_no -> customers.cif_no
+- cards.account_no -> accounts.account_no
 
 ## 6. Simple Usage Examples
 
-### Lấy tất cả thẻ của khách hàng
-
 ```sql
-SELECT card_id, masked_card_no, card_type, card_network, status
-FROM cards
-WHERE cif_no = 'CIF000001';
+SELECT * FROM cards LIMIT 5;
+SELECT * FROM cards WHERE cif_no = 'CIF000001' LIMIT 10;
 ```
-
-Dùng khi agent cần liệt kê thẻ để user chọn khi yêu cầu khóa/mở thẻ.
-
-### Tìm thẻ VISA đang active
-
-```sql
-SELECT card_id, masked_card_no, card_type, status
-FROM cards
-WHERE cif_no = 'CIF000066' AND card_network = 'VISA' AND status = 'ACTIVE';
-```
-
-Dùng khi user nói "khóa thẻ visa" — agent resolve card_id từ đây.
-
-### Kiểm tra hạn mức thẻ tín dụng
-
-```sql
-SELECT card_id, masked_card_no, credit_limit, available_limit
-FROM cards
-WHERE cif_no = 'CIF000066' AND card_type = 'CREDIT';
-```
-
-Dùng khi user hỏi "còn bao nhiêu hạn mức thẻ tín dụng".
-
-### Tìm thẻ đang bị khóa
-
-```sql
-SELECT card_id, masked_card_no, card_type, card_network
-FROM cards
-WHERE cif_no = 'CIF000066' AND status = 'LOCKED';
-```
-
-Dùng khi user yêu cầu "mở khóa thẻ" — agent cần biết thẻ nào đang locked.

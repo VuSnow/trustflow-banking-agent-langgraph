@@ -1,84 +1,53 @@
 # interest_rates
 
-## 1. Mục đích bảng
+## 1. Muc dich bang
 
-Lưu lãi suất sản phẩm tiết kiệm và vay của ngân hàng SHB. Agent dùng bảng này để tra cứu lãi suất hiện hành khi tư vấn tài chính cho khách hàng.
+Bang tham chieu lai suat tiet kiem/vay de tu van tai chinh.
 
-Nhóm: Reference/configuration data
+**Nhom:** Master/reference data
 
-## 2. Ngữ cảnh nghiệp vụ
+## 2. Ngu canh nghiep vu
 
-- Bảng này phục vụ financial planning agent: khi khách hỏi "gửi tiết kiệm 6 tháng được bao nhiêu lãi?" → agent query bảng này lấy annual_rate.
-- Lãi suất có hiệu lực theo ngày (effective_from/effective_to) và phân biệt theo kênh (ONLINE/COUNTER).
-- Mỗi sản phẩm có mức gửi tối thiểu (min_amount).
-- Sản phẩm bao gồm: tiết kiệm (SAVINGS) và vay (LOAN).
-- Phân khúc khách hàng: ALL (tất cả), RETAIL, PRIORITY, STUDENT.
+- Bang nay phuc vu luong xu ly cua cac agent trong he thong TrustFlow.
+- Du lieu duoc dung de truy van read model, xac thuc thong tin va truy vet audit.
+- Day la mock data cho demo, khong phai core ledger van hanh that.
 
 ## 3. Columns
 
-| Column | Type | Meaning | Example Values | Nullable | Notes |
-|---|---|---|---|---|---|
-| id | UUID | ID kỹ thuật | gen_random_uuid() | No | PK |
-| product_code | VARCHAR(50) | Mã sản phẩm | SAVINGS_ONLINE_6M, LOAN_PERSONAL | No | Unique identifier |
-| product_type | VARCHAR(30) | Loại sản phẩm | SAVINGS, LOAN | No | Filter chính |
-| product_name | VARCHAR(100) | Tên hiển thị | "Tiết kiệm online 6 tháng" | No | Hiển thị cho user |
-| currency | VARCHAR(3) | Loại tiền | VND | Yes | Default VND |
-| term_months | INT | Kỳ hạn (tháng) | 1, 3, 6, 12, 24, 240 | Yes | NULL = không kỳ hạn |
-| annual_rate | DECIMAL(5,2) | Lãi suất năm (%) | 4.50, 5.00, 8.50 | No | 4.50 = 4.5%/năm |
-| min_amount | DECIMAL(18,0) | Số tiền gửi tối thiểu | 1000000, 5000000 | Yes | VND |
-| max_amount | DECIMAL(18,0) | Số tiền gửi tối đa | NULL = không giới hạn | Yes | |
-| customer_segment | VARCHAR(30) | Phân khúc KH | ALL, RETAIL, PRIORITY | Yes | Default ALL |
-| channel | VARCHAR(20) | Kênh giao dịch | ALL, ONLINE, COUNTER | Yes | Online thường lãi cao hơn |
-| effective_from | DATE | Ngày bắt đầu hiệu lực | 2026-01-01 | No | |
-| effective_to | DATE | Ngày hết hiệu lực | NULL = vẫn còn hiệu lực | Yes | |
-| status | VARCHAR(10) | Trạng thái | ACTIVE, INACTIVE | Yes | Default ACTIVE |
-| created_at | TIMESTAMP | Thời điểm tạo | now() | Yes | |
+| Column | Type | Meaning | Example Values From Data | Nullable | Key / Relationship | Notes |
+|---|---|---|---|---|---|---|
+| id | UUID string | Truong du lieu nghiep vu | 5c292c0b-f70c-5d1a-94d0-19e5723107ad, ec800139-6fb2-531d-8929-9c4cf5d30709, 0c902f7f-81fe-5d94-8178-fcf34d2a9eab | No | - | - |
+| product_code | string | Ma tham chieu nghiep vu | DEMAND_VND, SAVINGS_ONLINE_1M, SAVINGS_ONLINE_3M | No | - | - |
+| product_type | enum string | Truong du lieu nghiep vu | SAVINGS, SAVINGS, SAVINGS | No | - | - |
+| product_name | string | Truong du lieu nghiep vu | Tien gui khong ky han, Tiet kiem online 1 thang, Tiet kiem online 3 thang | No | - | - |
+| currency | enum string | Truong du lieu nghiep vu | VND, VND, VND | No | - | - |
+| term_months | numeric | Truong du lieu nghiep vu | 1, 3, 6 | Yes | - | - |
+| annual_rate | numeric | Gia tri tai chinh | 0.1, 2.9, 3.4 | No | - | - |
+| min_amount | numeric | Truong du lieu nghiep vu | 0, 1000000, 1000000 | No | - | - |
+| max_amount | string | Truong du lieu nghiep vu | - | Yes | - | - |
+| customer_segment | enum string | Truong du lieu nghiep vu | ALL, ALL, ALL | No | - | - |
+| channel | enum string | Truong du lieu nghiep vu | ALL, ONLINE, ONLINE | No | - | - |
+| effective_from | date string | Truong du lieu nghiep vu | 2026-01-01, 2026-01-01, 2026-01-01 | No | - | - |
+| effective_to | string | Truong du lieu nghiep vu | - | Yes | - | - |
+| status | enum string | Trang thai/muc do theo workflow | ACTIVE, ACTIVE, ACTIVE | No | - | Gia tri phai khop enum cua workflow hien tai |
+| created_at | timestamp string | Moc thoi gian | 2026-01-01 00:00:00, 2026-01-01 00:00:00, 2026-01-01 00:00:00 | No | - | - |
 
 ## 4. Important Values / Enums
 
-- product_type: SAVINGS, LOAN
-- channel: ALL, ONLINE, COUNTER
-- customer_segment: ALL, RETAIL, PRIORITY, STUDENT
-- status: ACTIVE, INACTIVE
+| Column | Value | Meaning | Example Use Case |
+|---|---|---|---|
+| product_type | LOAN | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| product_type | SAVINGS | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| channel | ALL | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| channel | COUNTER | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| channel | ONLINE | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
 
 ## 5. Relationships
 
-- Không có FK từ bảng khác trỏ tới.
-- Standalone reference table.
+- Khong co quan he FK truc tiep.
 
 ## 6. Simple Usage Examples
 
-### Lấy lãi suất tiết kiệm online hiện hành
-
 ```sql
-SELECT product_name, term_months, annual_rate, min_amount
-FROM interest_rates
-WHERE product_type = 'SAVINGS'
-  AND status = 'ACTIVE'
-  AND (channel = 'ONLINE' OR channel = 'ALL')
-  AND effective_from <= CURRENT_DATE
-  AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
-ORDER BY term_months ASC;
-```
-
-### Tìm lãi suất theo kỳ hạn cụ thể
-
-```sql
-SELECT product_name, annual_rate, min_amount, channel
-FROM interest_rates
-WHERE product_type = 'SAVINGS'
-  AND term_months = 6
-  AND status = 'ACTIVE'
-  AND effective_from <= CURRENT_DATE
-  AND (effective_to IS NULL OR effective_to >= CURRENT_DATE);
-```
-
-### Lấy lãi suất vay
-
-```sql
-SELECT product_name, term_months, annual_rate, min_amount
-FROM interest_rates
-WHERE product_type = 'LOAN'
-  AND status = 'ACTIVE'
-ORDER BY annual_rate ASC;
+SELECT * FROM interest_rates LIMIT 5;
 ```

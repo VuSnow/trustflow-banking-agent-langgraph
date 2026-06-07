@@ -66,7 +66,8 @@ async def run_data_query_agent(
         }
 
     # Summarize results with LLM
-    results = data.get("results", [])
+    results_raw = data.get("results")
+    results = results_raw if isinstance(results_raw, list) else []
     sql = data.get("sql", "")
 
     summary = await _summarize_results(message, results)
