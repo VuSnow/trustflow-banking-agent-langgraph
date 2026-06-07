@@ -1,99 +1,43 @@
 # api_call_logs
 
-## 1. Mục đích bảng
+## 1. Muc dich bang
 
-Ghi nhận log mỗi lần agent gọi external banking API mock. Mỗi record tương ứng một HTTP call tới API bên ngoài, lưu request payload, response payload, HTTP status.
+Luu request/response khi goi external API mock.
 
-**Nhóm:** API call log
+**Nhom:** API call log
 
-## 2. Ngữ cảnh nghiệp vụ
+## 2. Ngu canh nghiep vu
 
-- Bảng này tồn tại để **audit trail** — ghi lại chính xác agent đã gọi API gì, với payload gì, kết quả ra sao.
-- Agent **không query** bảng này trong flow bình thường. Bảng này phục vụ:
-  - Debug khi giao dịch fail.
-  - Audit/compliance — trace lại mọi API call.
-  - Replay/retry logic.
-- Mỗi `api_call_log` liên kết với một `action_request` qua `action_id`.
-- Bảng này **không phải** nơi lưu transaction result. Kết quả giao dịch lưu ở `transactions`.
-- `response_payload` chứa `external_reference` — mã tham chiếu từ hệ thống external.
+- Bang nay phuc vu luong xu ly cua cac agent trong he thong TrustFlow.
+- Du lieu duoc dung de truy van read model, xac thuc thong tin va truy vet audit.
+- Day la mock data cho demo, khong phai core ledger van hanh that.
 
 ## 3. Columns
 
 | Column | Type | Meaning | Example Values From Data | Nullable | Key / Relationship | Notes |
 |---|---|---|---|---|---|---|
-| api_call_id | UUID string | ID kỹ thuật log entry | `1fc9f267-0993-5fc0-a950-891c60d88548` | No | PK | - |
-| action_id | UUID string | Action request liên quan | `10a66751-e588-52b3-8c89-c500d10fd465` | No | FK → action_requests.action_id | Mỗi action có thể có nhiều API call (retry) |
-| api_name | string | Tên API được gọi | `external_transfer_api`, `external_bill_payment_api`, `external_phone_topup_api`, `external_card_service_api` | Yes | - | Trùng với action_requests.api_name |
-| request_payload | JSON string | Payload gửi đi | `{"from_account_no": "92644220969", "to_account_no": "872975859883", ...}` | Yes | - | Exactly payload đã gửi |
-| response_payload | JSON string | Response nhận về | `{"external_reference": "EXTTRA000001", "status": "SUCCESS", "message": "Operation completed successfully"}` | Yes | - | Chứa external_reference nếu thành công |
-| http_status | numeric | HTTP status code | `200` | Yes | - | 200 = success, 4xx/5xx = error |
-| status | enum string | Kết quả call | `SUCCESS`, `FAILED` | Yes | - | Đơn giản hóa từ http_status |
-| created_at | timestamp string | Thời điểm gọi API | `2026-05-22 08:25:15` | Yes | - | - |
+| api_call_id | UUID string | Dinh danh ban ghi | 1fc9f267-0993-5fc0-a950-891c60d88548, ac784564-c041-51aa-aee0-3fdfc66de8ff, 3cc5f405-6f06-5d24-94b1-6092af95dfa9 | No | - | - |
+| action_id | UUID string | Dinh danh ban ghi | 10a66751-e588-52b3-8c89-c500d10fd465, 95ff56b0-cd92-5fc7-9f5a-c0c32ebbf29f, 44888f96-0759-502c-a6c8-1401b62fa66e | No | FK -> action_requests.action_id | - |
+| api_name | string | Truong du lieu nghiep vu | external_transfer_api, external_transfer_api, external_transfer_api | No | - | - |
+| request_payload | JSON string | Truong du lieu nghiep vu | {"from_account_no": "5861793271040", "to_account_no": "95429618446", "to_bank_code": "BIDV", "to_name": "Pham Duc Yen", "amount": 49177401, "currency": "VND", "description": "Chuyen tien cho Yen"}, {"from_account_no": "08330165712", "to_account_no": "3034615626244", "to_bank_code": "CTG", "to_name": "Le Van Minh", "amount": 2287078, "currency": "VND", "description": "Chuyen tien cho Minh"}, {"from_account_no": "1039308705", "to_account_no": "5668633414", "to_bank_code": "TCB", "to_name": "Vo Minh Nhi", "amount": 43753536, "currency": "VND", "description": "Chuyen tien cho Nhi"} | No | - | JSON payload phuc vu truy vet hoac dieu phoi flow |
+| response_payload | JSON string | Truong du lieu nghiep vu | {"external_reference": "EXTTRA000001", "status": "SUCCESS", "message": "Operation completed successfully"}, {"external_reference": "EXTTRA000002", "status": "SUCCESS", "message": "Operation completed successfully"}, {"external_reference": "EXTTRA000003", "status": "SUCCESS", "message": "Operation completed successfully"} | No | - | JSON payload phuc vu truy vet hoac dieu phoi flow |
+| http_status | numeric | Truong du lieu nghiep vu | 200, 200, 200 | No | - | - |
+| status | enum string | Trang thai/muc do theo workflow | SUCCESS, SUCCESS, SUCCESS | No | - | Gia tri phai khop enum cua workflow hien tai |
+| created_at | timestamp string | Moc thoi gian | 2026-05-12 18:35:19, 2026-05-09 10:52:55, 2026-04-07 19:17:12 | No | - | - |
 
 ## 4. Important Values / Enums
 
-### api_name
-
-| Value | Meaning | Dùng cho action_type |
-|---|---|---|
-| external_transfer_api | API chuyển khoản | TRANSFER |
-| external_bill_payment_api | API thanh toán hóa đơn | BILL_PAYMENT |
-| external_phone_topup_api | API nạp điện thoại | PHONE_TOPUP |
-| external_card_service_api | API dịch vụ thẻ | CARD_LOCK, CARD_UNLOCK, CARD_LIMIT_CHANGE |
-
-### status
-
-| Value | Meaning |
-|---|---|
-| SUCCESS | API trả về thành công (HTTP 200) |
-| FAILED | API trả về lỗi (HTTP 4xx/5xx) |
-
-### response_payload structure (SUCCESS)
-
-```json
-{
-  "external_reference": "EXTTRA000001",
-  "status": "SUCCESS",
-  "message": "Operation completed successfully"
-}
-```
+| Column | Value | Meaning | Example Use Case |
+|---|---|---|---|
+| status | FAILED | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | SUCCESS | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
 
 ## 5. Relationships
 
-- `api_call_logs.action_id` → `action_requests.action_id`
+- api_call_logs.action_id -> action_requests.action_id
 
 ## 6. Simple Usage Examples
 
-### Xem API call log của một action
-
 ```sql
-SELECT api_name, http_status, status, request_payload, response_payload, created_at
-FROM api_call_logs
-WHERE action_id = '10a66751-e588-52b3-8c89-c500d10fd465'
-ORDER BY created_at;
+SELECT * FROM api_call_logs LIMIT 5;
 ```
-
-Dùng khi cần trace API call đã thực hiện cho một action.
-
-### Tìm API call thất bại
-
-```sql
-SELECT acl.api_call_id, acl.api_name, acl.http_status, acl.response_payload, ar.user_text
-FROM api_call_logs acl
-JOIN action_requests ar ON acl.action_id = ar.action_id
-WHERE acl.status = 'FAILED'
-ORDER BY acl.created_at DESC
-LIMIT 10;
-```
-
-Dùng cho debug/monitoring — tìm các call bị lỗi.
-
-### Thống kê success rate theo API
-
-```sql
-SELECT api_name, status, COUNT(*) AS count
-FROM api_call_logs
-GROUP BY api_name, status;
-```
-
-Dùng cho monitoring chất lượng external API.

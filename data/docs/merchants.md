@@ -1,82 +1,50 @@
 # merchants
 
-## 1. Mục đích bảng
+## 1. Muc dich bang
 
-Lưu thông tin merchant (đơn vị chấp nhận thanh toán thẻ). Agent dùng bảng này để hiển thị tên merchant khi tra cứu giao dịch thẻ, phân tích chi tiêu theo danh mục.
+Danh muc merchant cho giao dich the va phan tich chi tieu.
 
-**Nhóm:** Master/reference data
+**Nhom:** Master/reference data
 
-## 2. Ngữ cảnh nghiệp vụ
+## 2. Ngu canh nghiep vu
 
-- Bảng này tồn tại để cung cấp context cho giao dịch thẻ — khi user hỏi "tôi đã chi bao nhiêu ở quán cà phê", agent cần join với bảng này.
-- Agent dùng bảng này để:
-  - Hiển thị tên merchant trong lịch sử giao dịch thẻ.
-  - Phân tích chi tiêu theo danh mục merchant (`merchant_category`).
-  - Tìm giao dịch tại một merchant cụ thể.
-- Phục vụ use case: tra cứu giao dịch thẻ (CARD_PAYMENT), phân tích chi tiêu.
-- Bảng này **không liên quan** đến chuyển tiền hay thanh toán hóa đơn.
-- Merchant data là reference data — agent chỉ đọc, không tạo merchant mới.
+- Bang nay phuc vu luong xu ly cua cac agent trong he thong TrustFlow.
+- Du lieu duoc dung de truy van read model, xac thuc thong tin va truy vet audit.
+- Day la mock data cho demo, khong phai core ledger van hanh that.
 
 ## 3. Columns
 
 | Column | Type | Meaning | Example Values From Data | Nullable | Key / Relationship | Notes |
 |---|---|---|---|---|---|---|
-| merchant_id | UUID string | ID kỹ thuật merchant | `a7ebff1a-de7e-5a29-9580-65e0a6129d5c` | No | PK | Dùng làm FK trong transactions |
-| merchant_name | string | Tên merchant | `Lotte Cinema`, `Pho 24`, `VNR Booking`, `Sendo` | No | - | Hiển thị cho user |
-| merchant_category | enum string | Danh mục merchant | `ENTERTAINMENT`, `FOOD`, `TRANSPORT`, `ECOMMERCE` | Yes | - | Dùng phân tích chi tiêu |
-| mcc_code | string | Mã MCC (Merchant Category Code) | `7832`, `5812`, `4121`, `5399` | Yes | - | Mã chuẩn quốc tế |
-| city | string | Thành phố | `Ho Chi Minh`, `Ha Noi`, `Can Tho` | Yes | - | - |
-| country | string | Quốc gia | `VN` | Yes | - | Mặc định VN |
-| status | enum string | Trạng thái | `ACTIVE`, `INACTIVE` | Yes | - | - |
+| merchant_id | UUID string | Dinh danh ban ghi | a7ebff1a-de7e-5a29-9580-65e0a6129d5c, 32e826b7-fef8-5745-8d32-fedd1ab1712a, ba1e4498-b0df-598f-9a86-f5db51c8c749 | No | PK | - |
+| merchant_name | string | Truong du lieu nghiep vu | Lotte Mart, Sendo, Baemin | No | - | - |
+| merchant_category | enum string | Truong du lieu nghiep vu | SHOPPING, ECOMMERCE, FOOD | No | - | - |
+| mcc_code | numeric | Ma tham chieu nghiep vu | 5691, 5399, 5812 | No | - | - |
+| city | string | Truong du lieu nghiep vu | Hai Phong, Ho Chi Minh, Can Tho | No | - | - |
+| country | enum string | Truong du lieu nghiep vu | VN, VN, VN | No | - | - |
+| status | enum string | Trang thai/muc do theo workflow | ACTIVE, ACTIVE, ACTIVE | No | - | Gia tri phai khop enum cua workflow hien tai |
 
 ## 4. Important Values / Enums
 
 | Column | Value | Meaning | Example Use Case |
 |---|---|---|---|
-| merchant_category | FOOD | Ăn uống | Phân tích chi tiêu ăn uống |
-| merchant_category | ENTERTAINMENT | Giải trí | Chi phí giải trí (phim, game) |
-| merchant_category | TRANSPORT | Đi lại | Chi phí di chuyển (Grab, vé tàu) |
-| merchant_category | ECOMMERCE | Mua sắm online | Đặt hàng trên Shopee, Sendo... |
-| merchant_category | SHOPPING | Mua sắm | Cửa hàng, thời trang |
-| merchant_category | GROCERY | Siêu thị / Tạp hóa | Mua sắm hàng ngày |
-| merchant_category | ELECTRONICS | Điện tử | Mua thiết bị điện tử |
-| merchant_category | DIGITAL_WALLET | Ví điện tử | Nạp ví MoMo, ZaloPay |
+| merchant_category | DIGITAL_WALLET | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| merchant_category | ECOMMERCE | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| merchant_category | ELECTRONICS | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| merchant_category | ENTERTAINMENT | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| merchant_category | FOOD | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| merchant_category | GROCERY | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| merchant_category | SHOPPING | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| merchant_category | TRANSPORT | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | ACTIVE | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | INACTIVE | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
 
 ## 5. Relationships
 
-- `merchants.merchant_id` được tham chiếu bởi `transactions.merchant_id`
+- Khong co quan he FK truc tiep.
 
 ## 6. Simple Usage Examples
 
-### Tìm giao dịch tại một merchant cụ thể
-
 ```sql
-SELECT t.transaction_ref, t.amount, t.transaction_time, m.merchant_name
-FROM transactions t
-JOIN merchants m ON t.merchant_id = m.merchant_id
-WHERE t.cif_no = 'CIF000001' AND m.merchant_name ILIKE '%Coffee%';
+SELECT * FROM merchants LIMIT 5;
 ```
-
-Dùng khi user hỏi "tôi chi bao nhiêu ở Coffee House".
-
-### Phân tích chi tiêu theo danh mục merchant
-
-```sql
-SELECT m.merchant_category, SUM(t.amount) AS total_spent
-FROM transactions t
-JOIN merchants m ON t.merchant_id = m.merchant_id
-WHERE t.cif_no = 'CIF000001' AND t.direction = 'OUT'
-GROUP BY m.merchant_category;
-```
-
-Dùng khi user hỏi "chi tiêu của tôi chia theo loại hình".
-
-### Liệt kê tất cả merchant trong danh mục
-
-```sql
-SELECT merchant_id, merchant_name, city
-FROM merchants
-WHERE merchant_category = 'FOOD' AND status = 'ACTIVE';
-```
-
-Dùng khi cần lookup merchant reference data.

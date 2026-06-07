@@ -1,83 +1,49 @@
 # reported_customers
 
-## 1. Mục đích bảng
+## 1. Muc dich bang
 
-Lưu trữ thông tin aggregate risk cho CIF (khách hàng) bị báo cáo lừa đảo nhiều lần hoặc sở hữu nhiều tài khoản bị report. Dùng khi 1 người sở hữu nhiều tài khoản lừa đảo.
+Bang tong hop muc do rui ro theo CIF bi bao cao.
 
-**Nhóm:** Fraud detection / transaction screening
+**Nhom:** Fraud detection / transaction screening
 
-## 2. Ngữ cảnh nghiệp vụ
+## 2. Ngu canh nghiep vu
 
-- Bảng này là **aggregate cấp CIF** từ `reported_accounts`.
-- Một CIF có thể sở hữu nhiều tài khoản bị report → tổng hợp risk tại đây.
-- Agent dùng bảng này để:
-  - Đánh giá risk tổng thể của 1 CIF bị báo cáo.
-  - Quyết định mức cảnh báo khi chuyển tiền tới bất kỳ TK nào thuộc CIF này.
-  - Phát hiện pattern: 1 người mở nhiều TK lừa đảo.
-- CIF ở đây là **CIF bên ngoài hệ thống** (CIF kẻ lừa đảo), không nhất thiết tồn tại trong bảng `customers`.
-- Bảng này **không phải** danh sách tất cả khách hàng. Chỉ chứa CIF đã bị link tới ít nhất 1 reported_account.
+- Bang nay phuc vu luong xu ly cua cac agent trong he thong TrustFlow.
+- Du lieu duoc dung de truy van read model, xac thuc thong tin va truy vet audit.
+- Day la mock data cho demo, khong phai core ledger van hanh that.
 
 ## 3. Columns
 
 | Column | Type | Meaning | Example Values From Data | Nullable | Key / Relationship | Notes |
 |---|---|---|---|---|---|---|
-| reported_customer_id | UUID string | ID record | `131ec971-efed-5a6b-9f41-6e41b2e264d5` | No | PK | - |
-| cif_no | string | CIF bị báo cáo | `CIF000067`, `CIF000080`, `CIF000071` | No | Unique | CIF kẻ lừa đảo (ngoài hệ thống) |
-| reported_account_count | integer | Số TK bị report | `1`, `2` | No | - | Thuộc CIF này |
-| valid_report_count | integer | Tổng report liên quan | `2`, `4` | No | - | Tổng report cho mọi TK của CIF |
-| total_reported_amount | numeric | Tổng tiền bị mất | `49701987`, `74015348`, `33205321` | No | - | VND |
-| risk_score | numeric | Điểm risk (0.0-1.0) | `0.4`, `0.7` | No | - | Aggregate từ reported_accounts |
-| risk_level | enum string | Mức risk | `WATCH`, `FROZEN` | No | - | Tương ứng risk_score |
-| status | enum string | Trạng thái | `ACTIVE` | No | - | Trạng thái CIF |
-| created_at | timestamp string | Thời điểm tạo | `2026-05-30 07:29:57` | No | - | - |
-| updated_at | timestamp string | Lần cập nhật cuối | `2026-05-23 11:45:41` | No | - | Cập nhật khi có report mới |
+| reported_customer_id | UUID string | Dinh danh ban ghi | 131ec971-efed-5a6b-9f41-6e41b2e264d5, 26d68bc2-633d-51a3-898e-2528febcc262, 8ce963ae-702f-5ba1-bba3-63599123eff0 | No | PK | - |
+| cif_no | enum string | Ma/so nghiep vu | CIF000070, CIF000082, CIF000075 | No | FK -> customers.cif_no | - |
+| reported_account_count | numeric | Truong du lieu nghiep vu | 2, 1, 1 | No | - | - |
+| valid_report_count | numeric | Truong du lieu nghiep vu | 2, 2, 3 | No | - | - |
+| total_reported_amount | numeric | Truong du lieu nghiep vu | 82851112, 31960662, 23149104 | No | - | - |
+| risk_score | numeric | Truong du lieu nghiep vu | 0.7, 0.4, 0.4 | No | - | - |
+| risk_level | enum string | Trang thai/muc do theo workflow | FROZEN, WATCH, WATCH | No | - | - |
+| status | enum string | Trang thai/muc do theo workflow | ACTIVE, ACTIVE, ACTIVE | No | - | Gia tri phai khop enum cua workflow hien tai |
+| created_at | timestamp string | Moc thoi gian | 2026-05-16 10:51:32, 2026-05-01 22:53:53, 2026-05-04 07:34:01 | No | - | - |
+| updated_at | timestamp string | Moc thoi gian | 2026-05-31 20:57:06, 2026-05-27 17:42:37, 2026-05-24 23:06:24 | No | - | - |
 
 ## 4. Important Values / Enums
 
-### risk_level
-
-| Value | Meaning | Implication |
-|---|---|---|
-| WATCH | Theo dõi (risk thấp-trung) | Cảnh báo nhẹ |
-| FROZEN | Bị đóng băng (risk cao) | Block tất cả giao dịch đến TK thuộc CIF |
-
-### status
-
-| Value | Meaning |
-|---|---|
-| ACTIVE | Đang trong hệ thống monitoring |
-| RESOLVED | Đã xử lý xong / cleared |
+| Column | Value | Meaning | Example Use Case |
+|---|---|---|---|
+| cif_no | CIF000070 | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| cif_no | CIF000075 | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| cif_no | CIF000082 | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| risk_level | FROZEN | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| risk_level | WATCH | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
 
 ## 5. Relationships
 
-- `reported_customers.cif_no` ← aggregate từ `reported_accounts.linked_customer_cif`
-- Một reported_customer có thể link tới nhiều `reported_accounts`
+- reported_customers.cif_no -> customers.cif_no
 
 ## 6. Simple Usage Examples
 
-### Tra cứu risk CIF bị báo cáo
-
 ```sql
-SELECT cif_no, reported_account_count, valid_report_count,
-       total_reported_amount, risk_score, risk_level
-FROM reported_customers
-WHERE cif_no = 'CIF000080';
-```
-
-### Danh sách CIF bị FROZEN
-
-```sql
-SELECT cif_no, reported_account_count, total_reported_amount, risk_score
-FROM reported_customers
-WHERE risk_level = 'FROZEN'
-ORDER BY risk_score DESC;
-```
-
-### CIF có nhiều tài khoản bị báo cáo nhất
-
-```sql
-SELECT cif_no, reported_account_count, valid_report_count, total_reported_amount
-FROM reported_customers
-ORDER BY reported_account_count DESC
-LIMIT 5;
+SELECT * FROM reported_customers LIMIT 5;
+SELECT * FROM reported_customers WHERE cif_no = 'CIF000001' LIMIT 10;
 ```

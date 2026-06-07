@@ -1,0 +1,25 @@
+-- fraud_decisions data
+BEGIN;
+
+-- fraud_decisions (18 rows)
+INSERT INTO fraud_decisions (decision_id, action_id, receiver_account_no, receiver_bank_code, matched_report_count, risk_score, risk_level, decision, reason_codes, created_at) VALUES
+  ('ac365eea-48c4-514a-8d7b-15f2da68abae', 'd97f11b6-08c6-5f73-8e6b-a740f087f632', '3045319433', 'STB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-21 10:14:08'),
+  ('04b38cb9-6fec-5a4f-9308-3fb2da436cda', '774ac552-112c-5961-9004-5b534c309a2f', '215226557676', 'VIB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-09 15:40:38'),
+  ('c66f6210-3bd6-55b4-85e6-e33059ab938e', 'd0ed39b1-093d-59b1-b922-51dd660f9625', '2971024817', 'TCB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-09 03:00:58'),
+  ('d68c2e8d-c84b-5726-b972-134551bcbcf4', '10a66751-e588-52b3-8c89-c500d10fd465', '95429618446', 'BIDV', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-12 18:35:17'),
+  ('91693558-3d67-54ea-86f7-52b66c6b8c7c', '812e5bae-75b6-5a61-80e6-091fdd4a121a', '16433481705', 'TPB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-02 18:39:47'),
+  ('f50c9374-3465-54d2-9d84-13d651f1af60', '11a9e652-86e8-508c-b853-7a006d2a77fb', '874485312417', 'MB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-01 22:55:17'),
+  ('003aec78-fed7-5857-b393-a3ef0ae690e9', '583f1833-4e96-59bd-9043-e8187c69fe04', '89877515366', 'CTG', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-03 23:13:53'),
+  ('3a5bbddd-7677-509f-acde-e744ab1fbc3e', '4b627631-6dac-5d03-ad17-8fcbc5c540c0', '4913370947', 'BIDV', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-29 05:25:47'),
+  ('89b0e2ba-106f-5cb4-ac5a-12f0e89de442', 'a1a2f7a6-e044-55a3-8506-61cc8a20e710', '5542340163', 'ACB', 0, 0.0, 'NONE', 'ALLOW', '["HIGH_RISK_ACTION"]'::jsonb, '2026-05-09 04:55:53'),
+  ('31b065b2-e246-51ef-9fde-57c5eeb4cbcb', 'b89dcb33-433b-549c-8641-44aef991352a', '05050573976', 'VIB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-09 15:43:19'),
+  ('831edfe2-bac4-54c3-9ed6-332ad20d40a2', '32859d4c-22d0-517e-b983-d12d30e9f1ec', '96724347014', 'VIB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-08 08:31:00'),
+  ('cc620d68-80b8-56f6-9cb3-b9ae0191df6f', '63e3c3d7-64e8-5cc3-acfd-10ff0a748e67', '79102697428', 'VIB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-11 14:19:34'),
+  ('ff3ca2ff-301d-5454-902f-df09ef96732a', 'e3599468-c3c5-5553-a362-f5fc1dfd5e63', '6690463643', 'VCB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-28 07:29:54'),
+  ('899106db-15df-536a-9be9-1c7660beef96', '7b58d922-e793-56d0-983d-b92d30beb063', '596309938425', 'CTG', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-05 07:55:36'),
+  ('8fc5a322-1975-579c-b957-a9aa2300a6b0', '490c74c9-8c95-5be0-9ad6-f90a9ea5d82e', '9162022328837', 'STB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-26 00:38:04'),
+  ('44cc85b4-f08b-5376-8886-66d4ac8c6d80', '7f2e6e84-5740-59cb-ad0f-3978874c55ac', '024972439920', 'TCB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-29 09:44:08'),
+  ('e376b7af-8ec9-5758-8d32-8fc4ab0af2d0', '45973ee2-6625-5c74-9127-7897f59e4936', '95633432447', 'BIDV', 0, 0.0, 'NONE', 'ALLOW', '["HIGH_RISK_ACTION"]'::jsonb, '2026-04-27 17:56:24'),
+  ('0f9b857b-7353-5499-aa3e-a88fbefaa29b', '95ff56b0-cd92-5fc7-9f5a-c0c32ebbf29f', '3034615626244', 'CTG', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-09 10:52:51');
+
+COMMIT;

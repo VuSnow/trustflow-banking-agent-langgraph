@@ -1,83 +1,44 @@
 # customer_biller_accounts
 
-## 1. Mục đích bảng
+## 1. Muc dich bang
 
-Lưu mapping giữa khách hàng ngân hàng và mã khách hàng tại các nhà cung cấp dịch vụ (biller). Ví dụ: khách hàng CIF000001 có mã hóa đơn điện PD867472238 tại EVN.
+Lien ket khach hang voi ma khach hang tai biller de truy xuat hoa don.
 
-**Nhóm:** Master/reference data
+**Nhom:** Master/reference data
 
-## 2. Ngữ cảnh nghiệp vụ
+## 2. Ngu canh nghiep vu
 
-- Bảng này tồn tại để agent resolve được mã hóa đơn (`customer_bill_code`) khi user yêu cầu thanh toán.
-- Agent dùng bảng này để:
-  - Tìm `customer_bill_code` khi user nói "thanh toán tiền điện" — không cần user nhớ mã.
-  - Tạo API payload cho `external_bill_payment_api` (cần `customer_bill_code` + `biller_id`).
-  - Hiển thị alias cho user xác nhận: "Thanh toán tiền điện - Nhà Hà Nội?".
-- Phục vụ use case: thanh toán hóa đơn (BILL_PAYMENT) — bước biller resolution.
-- `alias` là tên gọi user tự đặt, giúp agent match khi user nói "tiền điện nhà Hà Nội".
-- `last_paid_at` cho biết lần cuối thanh toán — hữu ích để suggest hóa đơn cần trả.
+- Bang nay phuc vu luong xu ly cua cac agent trong he thong TrustFlow.
+- Du lieu duoc dung de truy van read model, xac thuc thong tin va truy vet audit.
+- Day la mock data cho demo, khong phai core ledger van hanh that.
 
 ## 3. Columns
 
 | Column | Type | Meaning | Example Values From Data | Nullable | Key / Relationship | Notes |
 |---|---|---|---|---|---|---|
-| customer_biller_account_id | UUID string | ID kỹ thuật | `cc9c6130-5a30-5082-a79c-0d679825f36d` | No | PK | - |
-| cif_no | string | Mã khách hàng ngân hàng | `CIF000001`, `CIF000002` | No | FK → customers.cif_no | Filter theo khách hàng |
-| biller_id | UUID string | ID biller liên kết | `ecb27041-5475-5616-8e1f-fa9c73a0fa96` | No | FK → billers.biller_id | Join với billers để lấy tên/loại |
-| customer_bill_code | string | Mã khách hàng tại biller | `PD867472238`, `PD989388663`, `PI945489578`, `PP986082452` | Yes | - | Đưa vào API payload |
-| alias | string | Tên gợi nhớ do user đặt | `Nha Ha Noi`, `Internet nha`, `So phu` | Yes | - | Dùng match khi user nói alias |
-| status | enum string | Trạng thái đăng ký | `ACTIVE`, `INACTIVE` | Yes | - | Chỉ active mới dùng thanh toán |
-| last_paid_at | timestamp string | Lần cuối thanh toán | `2026-04-19 16:01:13`, `2026-02-02 19:22:48` | Yes | - | Null = chưa thanh toán lần nào |
+| customer_biller_account_id | UUID string | Dinh danh ban ghi | cc9c6130-5a30-5082-a79c-0d679825f36d, 46f294a4-f281-534b-a29a-38cf19aed95d, e10da766-5b9a-5637-8986-4e0eb4779710 | No | PK | - |
+| cif_no | string | Ma/so nghiep vu | CIF000001, CIF000002, CIF000004 | No | FK -> customers.cif_no | - |
+| biller_id | UUID string | Dinh danh ban ghi | da19a037-7425-578c-b215-9721338a9344, aa643e7e-8e96-5d5a-be2f-93f48b8eb59f, 561cbccd-d404-5833-a5e8-ba6158e9d5a7 | No | FK -> billers.biller_id | - |
+| customer_bill_code | string | Ma tham chieu nghiep vu | PD915929556, PD778476227, PD996981471 | No | - | - |
+| alias | string | Truong du lieu nghiep vu | Nha bo me, Nha Ha Noi, Nha bo me | No | - | - |
+| status | enum string | Trang thai/muc do theo workflow | ACTIVE, ACTIVE, ACTIVE | No | - | Gia tri phai khop enum cua workflow hien tai |
+| last_paid_at | timestamp string | Moc thoi gian | 2026-03-15 02:23:22, 2026-04-25 13:03:31, 2026-02-21 00:45:30 | Yes | - | - |
 
 ## 4. Important Values / Enums
 
 | Column | Value | Meaning | Example Use Case |
 |---|---|---|---|
-| status | ACTIVE | Đang sử dụng | Có thể thanh toán |
-| status | INACTIVE | Ngưng sử dụng | Không hiển thị / không cho thanh toán |
-
-Prefix mã `customer_bill_code`:
-- `PD` — Power/Điện (ELECTRICITY)
-- `PI` — Internet
-- `PP` — Phone Postpaid
-- `PW` — Water (example format)
+| status | ACTIVE | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | INACTIVE | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
 
 ## 5. Relationships
 
-- `customer_biller_accounts.cif_no` → `customers.cif_no`
-- `customer_biller_accounts.biller_id` → `billers.biller_id`
+- customer_biller_accounts.cif_no -> customers.cif_no
+- customer_biller_accounts.biller_id -> billers.biller_id
 
 ## 6. Simple Usage Examples
 
-### Lấy danh sách hóa đơn đã đăng ký của khách hàng
-
 ```sql
-SELECT cba.customer_bill_code, cba.alias, b.biller_name, b.biller_type, cba.last_paid_at
-FROM customer_biller_accounts cba
-JOIN billers b ON cba.biller_id = b.biller_id
-WHERE cba.cif_no = 'CIF000001' AND cba.status = 'ACTIVE';
+SELECT * FROM customer_biller_accounts LIMIT 5;
+SELECT * FROM customer_biller_accounts WHERE cif_no = 'CIF000001' LIMIT 10;
 ```
-
-Dùng khi user hỏi "tôi có những hóa đơn nào" hoặc khi cần liệt kê để user chọn.
-
-### Tìm mã hóa đơn điện của khách hàng
-
-```sql
-SELECT cba.customer_bill_code, cba.alias, b.biller_name
-FROM customer_biller_accounts cba
-JOIN billers b ON cba.biller_id = b.biller_id
-WHERE cba.cif_no = 'CIF000002' AND b.biller_type = 'ELECTRICITY' AND cba.status = 'ACTIVE';
-```
-
-Dùng khi user nói "thanh toán tiền điện" — agent resolve bill_code từ đây.
-
-### Tìm hóa đơn theo alias
-
-```sql
-SELECT cba.customer_bill_code, b.biller_name, b.biller_type
-FROM customer_biller_accounts cba
-JOIN billers b ON cba.biller_id = b.biller_id
-WHERE cba.cif_no = 'CIF000002' AND cba.alias ILIKE '%internet%' AND cba.status = 'ACTIVE';
-```
-
-Dùng khi user nói "trả tiền internet nhà" — match alias.

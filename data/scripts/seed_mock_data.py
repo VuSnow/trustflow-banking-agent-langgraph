@@ -142,6 +142,8 @@ beneficiaries = []
 merchants = []
 billers = []
 customer_biller_accounts = []
+bills = []
+interest_rates = []
 transaction_categories = []
 transactions = []
 action_requests = []
@@ -249,6 +251,15 @@ def generate_accounts():
                 "balance": balance,
                 "available_balance": avail,
                 "status": status,
+                "is_primary": j == 0,
+                "closed_at": "" if status != "CLOSED" else random_timestamp(datetime(2025, 1, 1), FIXED_NOW).strftime("%Y-%m-%d %H:%M:%S"),
+                "nickname": random.choice([
+                    "Tai khoan chinh",
+                    "Luong",
+                    "Tiet kiem",
+                    "Chi tieu",
+                    "Du phong",
+                ]) if random.random() < 0.55 else "",
                 "opened_at": opened_at.strftime("%Y-%m-%d %H:%M:%S"),
             }
             accounts.append(acc)
@@ -301,7 +312,9 @@ def generate_cards():
             if r3 < 0.80:
                 status = "ACTIVE"
             elif r3 < 0.95:
-                status = "LOCKED"
+                status = "TEMP_LOCKED"
+            elif r3 < 0.98:
+                status = "LOST"
             else:
                 status = "EXPIRED"
 
@@ -604,6 +617,106 @@ def generate_customer_biller_accounts():
             customer_biller_accounts.append(cba)
             cba_by_cif[cif].append(cba)
             idx += 1
+
+
+def generate_bills():
+    """Generate monthly bills for registered biller accounts."""
+    global bills
+    idx = 1
+    biller_by_id = {b["biller_id"]: b for b in billers}
+    month_windows = [(2026, 6), (2026, 5), (2026, 4), (2026, 3)]
+    amount_ranges = {
+        "ELECTRICITY": (250000, 3200000),
+        "WATER": (80000, 850000),
+        "INTERNET": (180000, 950000),
+        "PHONE_POSTPAID": (90000, 780000),
+    }
+    due_days = {
+        "ELECTRICITY": 10,
+        "WATER": 14,
+        "INTERNET": 18,
+        "PHONE_POSTPAID": 20,
+    }
+
+    active_cbas = [c for c in customer_biller_accounts if c["status"] == "ACTIVE"]
+    for cba in active_cbas:
+        biller = biller_by_id.get(cba["biller_id"])
+        if not biller:
+            continue
+
+        btype = biller["biller_type"]
+        low, high = amount_ranges.get(btype, (120000, 1500000))
+        months = month_windows[: random.randint(2, 4)]
+        latest_unpaid = random.random() < 0.72
+
+        for m_idx, (year, month) in enumerate(months):
+            amount = random.randint(low, high)
+            due_date = datetime(year, month, min(due_days.get(btype, 15), 28), 9, 0, 0)
+            created_at = due_date - timedelta(days=random.randint(7, 14))
+
+            if m_idx == 0:
+                status = "UNPAID" if latest_unpaid else "PAID"
+            else:
+                status = "PAID" if random.random() < 0.92 else "UNPAID"
+
+            if status == "PAID":
+                paid_at = due_date - timedelta(days=random.randint(0, 5), hours=random.randint(1, 20))
+                paid_at_str = paid_at.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                paid_at_str = ""
+
+            bills.append({
+                "bill_id": make_id("bills", idx),
+                "biller_code": biller["biller_code"],
+                "customer_bill_code": cba["customer_bill_code"],
+                "bill_period": f"{year}-{month:02d}",
+                "amount_due": amount,
+                "due_date": due_date.strftime("%Y-%m-%d"),
+                "status": status,
+                "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "paid_at": paid_at_str,
+            })
+            idx += 1
+
+
+def generate_interest_rates():
+    """Generate deterministic savings/loan interest rate catalog."""
+    global interest_rates
+    rows = [
+        ("DEMAND_VND", "SAVINGS", "Tien gui khong ky han", "", 0.10, 0, "", "ALL", "ALL"),
+        ("SAVINGS_ONLINE_1M", "SAVINGS", "Tiet kiem online 1 thang", 1, 2.90, 1000000, "", "ALL", "ONLINE"),
+        ("SAVINGS_ONLINE_3M", "SAVINGS", "Tiet kiem online 3 thang", 3, 3.40, 1000000, "", "ALL", "ONLINE"),
+        ("SAVINGS_ONLINE_6M", "SAVINGS", "Tiet kiem online 6 thang", 6, 4.50, 1000000, "", "ALL", "ONLINE"),
+        ("SAVINGS_ONLINE_12M", "SAVINGS", "Tiet kiem online 12 thang", 12, 5.00, 1000000, "", "ALL", "ONLINE"),
+        ("SAVINGS_ONLINE_24M", "SAVINGS", "Tiet kiem online 24 thang", 24, 5.20, 1000000, "", "ALL", "ONLINE"),
+        ("SAVINGS_COUNTER_3M", "SAVINGS", "Tiet kiem quay 3 thang", 3, 3.20, 5000000, "", "ALL", "COUNTER"),
+        ("SAVINGS_COUNTER_6M", "SAVINGS", "Tiet kiem quay 6 thang", 6, 4.30, 5000000, "", "ALL", "COUNTER"),
+        ("SAVINGS_COUNTER_12M", "SAVINGS", "Tiet kiem quay 12 thang", 12, 4.80, 5000000, "", "ALL", "COUNTER"),
+        ("SAVINGS_COUNTER_24M", "SAVINGS", "Tiet kiem quay 24 thang", 24, 5.00, 5000000, "", "ALL", "COUNTER"),
+        ("LOAN_PERSONAL_12M", "LOAN", "Vay tieu dung 12 thang", 12, 8.50, 10000000, "", "ALL", "ALL"),
+        ("LOAN_PERSONAL_24M", "LOAN", "Vay tieu dung 24 thang", 24, 9.00, 10000000, "", "ALL", "ALL"),
+        ("LOAN_MORTGAGE", "LOAN", "Vay mua nha", 240, 7.20, 100000000, "", "ALL", "ALL"),
+    ]
+
+    for i, row in enumerate(rows, 1):
+        product_code, product_type, product_name, term_months, annual_rate, min_amount, max_amount, segment, channel = row
+        interest_rates.append({
+            "id": make_id("interest_rates", i),
+            "product_code": product_code,
+            "product_type": product_type,
+            "product_name": product_name,
+            "currency": "VND",
+            "term_months": term_months,
+            "annual_rate": annual_rate,
+            "min_amount": min_amount,
+            "max_amount": max_amount,
+            "customer_segment": segment,
+            "channel": channel,
+            "effective_from": "2026-01-01",
+            "effective_to": "",
+            "status": "ACTIVE",
+            "created_at": "2026-01-01 00:00:00",
+        })
 
 
 def generate_transaction_categories():
@@ -1288,6 +1401,7 @@ def generate_transactions():
             "counterparty_bank_code": txn_data["counterparty_bank_code"],
             "counterparty_name": txn_data["counterparty_name"],
             "channel": txn_data["channel"],
+            "note": txn_data["description"],
             "description": txn_data["description"],
             "status": txn_data["status"],
             "balance_after": balance_after,
@@ -2017,6 +2131,8 @@ def validate_data():
 
     cif_set = {c["cif_no"] for c in customers}
     acc_no_set = {a["account_no"] for a in accounts}
+    cba_bill_code_set = {c["customer_bill_code"] for c in customer_biller_accounts if c.get("customer_bill_code")}
+    biller_code_set = {b["biller_code"] for b in billers}
     card_id_set = {c["card_id"] for c in cards}
     merchant_id_set = {m["merchant_id"] for m in merchants}
     biller_id_set = {b["biller_id"] for b in billers}
@@ -2042,6 +2158,11 @@ def validate_data():
     for cba in customer_biller_accounts:
         assert cba["cif_no"] in cif_set, f"cba cif FK fail: {cba['cif_no']}"
         assert cba["biller_id"] in biller_id_set, f"cba biller FK fail: {cba['biller_id']}"
+
+    # FK: bills
+    for bill in bills:
+        assert bill["biller_code"] in biller_code_set, f"bills biller_code FK fail: {bill['bill_id']}"
+        assert bill["customer_bill_code"] in cba_bill_code_set, f"bills customer_bill_code FK fail: {bill['bill_id']}"
 
     # FK: transactions
     for t in transactions:
@@ -2080,6 +2201,9 @@ def validate_data():
         cif = c["cif_no"]
         active_payment = [a for a in accts_by_cif[cif] if a["status"] == "ACTIVE" and a["account_type"] == "PAYMENT"]
         assert len(active_payment) >= 1, f"ACTIVE customer {cif} has no ACTIVE PAYMENT account"
+
+        primary_accounts = [a for a in accts_by_cif[cif] if a.get("is_primary")]
+        assert len(primary_accounts) >= 1, f"Customer {cif} has no primary account"
 
     # CARD_PAYMENT must have card_id and merchant_id
     for t in transactions:
@@ -2183,6 +2307,8 @@ Data is deterministic (seed=42) and reproducible.
 | 10 | action_requests | {actions} |
 | 11 | api_call_logs | {api_logs} |
 | 12 | audit_logs | {audit_logs} |
+| 13 | bills | {bills} |
+| 14 | interest_rates | {interest_rates} |
 
 ## Relationships (Text ER)
 
@@ -2215,6 +2341,7 @@ transaction_categories (category_id) ─< transactions
 | Anomaly detection | transactions (amount, time, beneficiary_id=null) |
 | Fee inquiry | transactions (type=FEE) |
 | Salary check | transactions (type=SALARY) |
+| Rate inquiry | interest_rates |
 
 ## Sample Text2SQL Queries
 
@@ -2381,6 +2508,8 @@ WHERE cif_no = :cif_no
         actions=len(action_requests),
         api_logs=len(api_call_logs),
         audit_logs=len(audit_logs),
+        bills=len(bills),
+        interest_rates=len(interest_rates),
     )
 
     with open(OUTPUT_DIR / "README.md", "w", encoding="utf-8") as f:
@@ -2410,6 +2539,10 @@ def main():
     generate_billers()
     print("  customer_biller_accounts...")
     generate_customer_biller_accounts()
+    print("  bills...")
+    generate_bills()
+    print("  interest_rates...")
+    generate_interest_rates()
     print("  transaction_categories...")
     generate_transaction_categories()
     print("  transactions...")
@@ -2432,7 +2565,7 @@ def main():
               ["customer_id", "cif_no", "full_name", "phone_number", "email", "kyc_level", "status", "created_at"])
 
     write_csv("accounts.csv", accounts,
-              ["account_id", "account_no", "cif_no", "account_type", "currency", "balance", "available_balance", "status", "opened_at"])
+              ["account_id", "account_no", "cif_no", "account_type", "currency", "balance", "available_balance", "status", "is_primary", "closed_at", "nickname", "opened_at"])
 
     write_csv("cards.csv", cards,
               ["card_id", "cif_no", "account_no", "masked_card_no", "card_type", "card_network", "credit_limit", "available_limit", "status", "issued_at"])
@@ -2449,11 +2582,17 @@ def main():
     write_csv("customer_biller_accounts.csv", customer_biller_accounts,
               ["customer_biller_account_id", "cif_no", "biller_id", "customer_bill_code", "alias", "status", "last_paid_at"])
 
+    write_csv("bills.csv", bills,
+              ["bill_id", "biller_code", "customer_bill_code", "bill_period", "amount_due", "due_date", "status", "created_at", "paid_at"])
+
+    write_csv("interest_rates.csv", interest_rates,
+              ["id", "product_code", "product_type", "product_name", "currency", "term_months", "annual_rate", "min_amount", "max_amount", "customer_segment", "channel", "effective_from", "effective_to", "status", "created_at"])
+
     write_csv("transaction_categories.csv", transaction_categories,
               ["category_id", "category_code", "category_name", "category_group"])
 
     write_csv("transactions.csv", transactions,
-              ["transaction_id", "transaction_ref", "cif_no", "account_no", "card_id", "transaction_time", "amount", "currency", "direction", "transaction_type", "category_id", "merchant_id", "biller_id", "beneficiary_id", "counterparty_account_no", "counterparty_bank_code", "counterparty_name", "channel", "description", "status", "balance_after", "external_reference", "created_at"])
+              ["transaction_id", "transaction_ref", "cif_no", "account_no", "card_id", "transaction_time", "amount", "currency", "direction", "transaction_type", "category_id", "merchant_id", "biller_id", "beneficiary_id", "counterparty_account_no", "counterparty_bank_code", "counterparty_name", "channel", "note", "description", "status", "balance_after", "external_reference", "created_at"])
 
     write_csv("action_requests.csv", action_requests,
               ["action_id", "cif_no", "action_type", "status", "user_text", "api_name", "api_payload", "resolved_entities", "missing_fields", "risk_score", "risk_tier", "requires_confirmation", "requires_otp", "created_at", "updated_at"])
@@ -2505,6 +2644,8 @@ def main():
     print(f"  merchants:               {len(merchants):>6}")
     print(f"  billers:                 {len(billers):>6}")
     print(f"  customer_biller_accounts:{len(customer_biller_accounts):>6}")
+    print(f"  bills:                   {len(bills):>6}")
+    print(f"  interest_rates:          {len(interest_rates):>6}")
     print(f"  transaction_categories:  {len(transaction_categories):>6}")
     print(f"  transactions:            {len(transactions):>6}")
     print(f"  action_requests:         {len(action_requests):>6}")

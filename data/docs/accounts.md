@@ -1,82 +1,51 @@
 # accounts
 
-## 1. Mục đích bảng
+## 1. Muc dich bang
 
-Lưu thông tin tài khoản ngân hàng của khách hàng. Mỗi khách hàng có thể có nhiều tài khoản (thanh toán, tiết kiệm, settlement thẻ tín dụng). Đây là bảng agent dùng để xác định tài khoản nguồn khi thực hiện giao dịch.
+Luu tai khoan ngan hang cua khach hang, dung cho xem so du va chon tai khoan nguon.
 
-**Nhóm:** Master/reference data
+**Nhom:** Master/reference data
 
-## 2. Ngữ cảnh nghiệp vụ
+## 2. Ngu canh nghiep vu
 
-- Bảng này tồn tại để agent biết khách hàng có những tài khoản nào, số dư bao nhiêu, và tài khoản nào đang active.
-- Agent dùng bảng này để:
-  - Chọn tài khoản nguồn (`from_account_no`) khi tạo API payload chuyển tiền/thanh toán.
-  - Kiểm tra số dư khả dụng (`available_balance`) trước khi confirm giao dịch.
-  - Liệt kê danh sách tài khoản cho khách hàng chọn.
-- Phục vụ use case: chuyển tiền, thanh toán hóa đơn, nạp điện thoại (đều cần `account_no` làm nguồn).
-- Bảng này **không phải** ledger thật. Số dư là snapshot read model, không phải source of truth.
+- Bang nay phuc vu luong xu ly cua cac agent trong he thong TrustFlow.
+- Du lieu duoc dung de truy van read model, xac thuc thong tin va truy vet audit.
+- Day la mock data cho demo, khong phai core ledger van hanh that.
 
 ## 3. Columns
 
 | Column | Type | Meaning | Example Values From Data | Nullable | Key / Relationship | Notes |
 |---|---|---|---|---|---|---|
-| account_id | UUID string | ID kỹ thuật tài khoản | `6d253ff0-49a0-528a-be58-111a54d53b11` | No | PK | - |
-| account_no | string | Số tài khoản ngân hàng | `31243292127`, `9955271774490`, `411998679807` | No | Unique | Dùng trong API payload, hiển thị cho user |
-| cif_no | string | Mã khách hàng sở hữu tài khoản | `CIF000001`, `CIF000002`, `CIF000003` | No | FK → customers.cif_no | Dùng để filter tài khoản theo khách hàng |
-| account_type | enum string | Loại tài khoản | `PAYMENT`, `SAVINGS`, `CREDIT_CARD_SETTLEMENT` | Yes | - | Agent thường dùng tài khoản PAYMENT làm nguồn |
-| currency | string | Đơn vị tiền tệ | `VND` | Yes | - | Mặc định VND |
-| balance | numeric | Số dư hiện tại | `249582907`, `272874417`, `488542479` | Yes | - | Đơn vị: đồng (VND) |
-| available_balance | numeric | Số dư khả dụng (trừ hold) | `240389988`, `234979964`, `474605528` | Yes | - | Agent kiểm tra field này trước khi confirm giao dịch |
-| status | enum string | Trạng thái tài khoản | `ACTIVE`, `FROZEN`, `CLOSED` | Yes | - | Chỉ tài khoản ACTIVE mới dùng giao dịch được |
-| opened_at | timestamp string | Thời điểm mở tài khoản | `2025-06-19 04:08:10`, `2023-02-28 10:05:59` | Yes | - | - |
+| account_id | UUID string | Dinh danh ban ghi | 6d253ff0-49a0-528a-be58-111a54d53b11, 71711e0b-a4f2-59f7-ab7d-bea0622956d8, 28c84f3a-fef9-53cd-99c3-dbf18b02705d | No | PK | - |
+| account_no | numeric | Ma/so nghiep vu | 31243292127, 527177449058, 9986798079 | No | Unique | - |
+| cif_no | string | Ma/so nghiep vu | CIF000001, CIF000001, CIF000002 | No | FK -> customers.cif_no | - |
+| account_type | enum string | Truong du lieu nghiep vu | PAYMENT, PAYMENT, PAYMENT | No | - | - |
+| currency | enum string | Truong du lieu nghiep vu | VND, VND, VND | No | - | - |
+| balance | numeric | Gia tri tai chinh | 249582907, 167148945, 350452571 | No | - | - |
+| available_balance | numeric | Gia tri tai chinh | 240389988, 153653568, 307780036 | No | - | - |
+| status | enum string | Trang thai/muc do theo workflow | ACTIVE, ACTIVE, ACTIVE | No | - | Gia tri phai khop enum cua workflow hien tai |
+| is_primary | boolean | Truong du lieu nghiep vu | True, False, True | No | - | Co/khong theo logic nghiep vu |
+| closed_at | timestamp string | Moc thoi gian | 2025-06-07 03:29:04, 2025-04-22 05:53:30 | Yes | - | - |
+| nickname | string | Truong du lieu nghiep vu | Du phong, Luong, Tiet kiem | Yes | - | - |
+| opened_at | timestamp string | Moc thoi gian | 2025-06-19 04:08:10, 2024-07-26 19:32:02, 2025-07-28 20:15:08 | No | - | - |
 
 ## 4. Important Values / Enums
 
 | Column | Value | Meaning | Example Use Case |
 |---|---|---|---|
-| account_type | PAYMENT | Tài khoản thanh toán | Dùng làm tài khoản nguồn chuyển tiền, thanh toán |
-| account_type | SAVINGS | Tài khoản tiết kiệm | Không dùng giao dịch trực tiếp, chỉ hiển thị số dư |
-| account_type | CREDIT_CARD_SETTLEMENT | Tài khoản quyết toán thẻ tín dụng | Liên kết với thẻ credit |
-| status | ACTIVE | Đang hoạt động | Cho phép giao dịch |
-| status | FROZEN | Bị đóng băng | Từ chối giao dịch, hiển thị cảnh báo |
-| status | CLOSED | Đã đóng | Không hiển thị cho user |
+| account_type | PAYMENT | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| account_type | SAVINGS | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | ACTIVE | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | CLOSED | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
+| status | FROZEN | Gia tri enum trong du lieu | Loc/truy van theo trang thai/loai |
 
 ## 5. Relationships
 
-- `accounts.cif_no` → `customers.cif_no`
-- `accounts.account_no` được tham chiếu bởi:
-  - `cards.account_no`
-  - `transactions.account_no`
+- accounts.cif_no -> customers.cif_no
 
 ## 6. Simple Usage Examples
 
-### Lấy tất cả tài khoản active của khách hàng
-
 ```sql
-SELECT account_no, account_type, balance, available_balance, status
-FROM accounts
-WHERE cif_no = 'CIF000001' AND status = 'ACTIVE';
+SELECT * FROM accounts LIMIT 5;
+SELECT * FROM accounts WHERE cif_no = 'CIF000001' LIMIT 10;
 ```
-
-Dùng khi agent cần liệt kê tài khoản để user chọn nguồn giao dịch.
-
-### Kiểm tra số dư khả dụng trước khi chuyển tiền
-
-```sql
-SELECT account_no, available_balance
-FROM accounts
-WHERE account_no = '31243292127' AND status = 'ACTIVE';
-```
-
-Dùng trong bước validate trước khi tạo API payload.
-
-### Lấy tài khoản thanh toán mặc định
-
-```sql
-SELECT account_no, balance, available_balance
-FROM accounts
-WHERE cif_no = 'CIF000001' AND account_type = 'PAYMENT' AND status = 'ACTIVE'
-LIMIT 1;
-```
-
-Dùng khi user không chỉ định tài khoản nguồn — agent tự chọn tài khoản PAYMENT đầu tiên.

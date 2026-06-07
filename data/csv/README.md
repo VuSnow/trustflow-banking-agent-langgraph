@@ -11,17 +11,19 @@ Data is deterministic (seed=42) and reproducible.
 | # | Table | Rows |
 |---|-------|------|
 | 1 | customers | 100 |
-| 2 | accounts | 193 |
-| 3 | cards | 93 |
-| 4 | beneficiaries | 354 |
-| 5 | merchants | 81 |
+| 2 | accounts | 206 |
+| 3 | cards | 89 |
+| 4 | beneficiaries | 359 |
+| 5 | merchants | 80 |
 | 6 | billers | 20 |
-| 7 | customer_biller_accounts | 215 |
+| 7 | customer_biller_accounts | 209 |
 | 8 | transaction_categories | 20 |
-| 9 | transactions | 5031 |
+| 9 | transactions | 5027 |
 | 10 | action_requests | 120 |
-| 11 | api_call_logs | 66 |
-| 12 | audit_logs | 828 |
+| 11 | api_call_logs | 71 |
+| 12 | audit_logs | 824 |
+| 13 | bills | 544 |
+| 14 | interest_rates | 13 |
 
 ## Relationships (Text ER)
 
@@ -54,6 +56,7 @@ transaction_categories (category_id) ─< transactions
 | Anomaly detection | transactions (amount, time, beneficiary_id=null) |
 | Fee inquiry | transactions (type=FEE) |
 | Salary check | transactions (type=SALARY) |
+| Rate inquiry | interest_rates |
 
 ## Sample Text2SQL Queries
 
