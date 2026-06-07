@@ -21,7 +21,7 @@ Task types:
 - TRANSACTION: user wants to perform money movement or payment.
 - CARD_OPERATION: user wants to manage a bank card.
 - ACCOUNT_OPERATION: user wants to open, close, update, or manage a bank account or beneficiary.
-- FRAUD_REPORT: user wants to report a scam, fraud, or suspicious transaction.
+- FRAUD_REPORT: user wants to report a scam/fraud/suspicious transaction, or check whether an account is risky, fraudulent, scam-related, suspicious, blacklisted, safe, or safe to transfer to.
 
 Operations:
 
@@ -47,6 +47,7 @@ Routing rules:
 - If the user wants to lock, unlock, report lost (báo mất), activate, replace, or change card settings → CARD_OPERATION.
 - If the user wants to open, close, update, or manage an account/beneficiary → ACCOUNT_OPERATION.
 - If the user wants to report fraud, scam, or a suspicious transaction → FRAUD_REPORT.
+- If the user asks whether a specific account is fraud/scam/suspicious/risky/blacklisted/safe/safe to transfer to → FRAUD_REPORT with operation CHECK_ACCOUNT_RISK.
 - EXCEPTION: "báo mất thẻ" (report lost card) is CARD_OPERATION (not FRAUD_REPORT). Only classify as FRAUD_REPORT when the user reports fraud, scam, or phishing.
 - If the user asks to plan spending from now until the next salary/payday ("đến ngày nhận lương", "sống tới lương") → FINANCE_PLANNING.
 - If the user wants help understanding spending habits, budgeting, savings → FINANCE_ADVICE.
