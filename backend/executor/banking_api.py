@@ -182,6 +182,7 @@ async def call_transfer_api(
                 "transaction_ref": transaction_ref,
                 "amount": amount,
                 "fee": fee,
+                "balance_before": balance,
                 "balance_after": new_balance,
                 "timestamp": now.isoformat(timespec="seconds"),
             }

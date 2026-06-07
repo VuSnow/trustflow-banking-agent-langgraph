@@ -244,7 +244,7 @@ button {
 }
 
 .message {
-  max-width: min(860px, 100%);
+  max-width: 100%;
   padding: 14px 16px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -254,11 +254,13 @@ button {
 
 .message.user {
   align-self: flex-end;
+  max-width: min(860px, 100%);
   background: var(--user);
 }
 
 .message.assistant {
   align-self: flex-start;
+  width: min(100%, 1040px);
   background: var(--assistant);
 }
 
@@ -326,6 +328,352 @@ button {
 .message-text th {
   background: rgba(255, 255, 255, 0.04);
   font-weight: 700;
+}
+
+.message-text .risk-gauge-card {
+  margin: 0 0 0.9rem;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(180deg, rgba(245, 247, 251, 0.16) 0%, rgba(255, 255, 255, 0.08) 100%);
+}
+
+.message-text .risk-gauge-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.message-text .risk-gauge-card__title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 760;
+}
+
+.message-text .risk-gauge-card__chip {
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 0.78rem;
+  font-weight: 760;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.message-text .risk-gauge-card--high .risk-gauge-card__chip {
+  background: rgba(239, 68, 68, 0.22);
+  border: 1px solid rgba(252, 165, 165, 0.45);
+  color: #fecaca;
+}
+
+.message-text .risk-gauge-card--medium .risk-gauge-card__chip {
+  background: rgba(245, 158, 11, 0.2);
+  border: 1px solid rgba(252, 211, 77, 0.4);
+  color: #fde68a;
+}
+
+.message-text .risk-gauge-card__score-title {
+  margin-bottom: 8px;
+  color: rgba(238, 242, 232, 0.85);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.8rem;
+  font-weight: 720;
+}
+
+.message-text .risk-gauge-card__score-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.message-text .risk-gauge-card__score-label {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.message-text .risk-gauge-card__score-value {
+  color: #ffc7c7;
+  font-family: "JetBrains Mono", "Consolas", monospace;
+  font-size: 1.02rem;
+  font-weight: 700;
+}
+
+.message-text .risk-meter {
+  position: relative;
+  width: 100%;
+  height: 14px;
+  margin-bottom: 8px;
+}
+
+.message-text .risk-meter__bar {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #10b981 0%, #f59e0b 55%, #ef4444 100%);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+}
+
+.message-text .risk-meter__thumb {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff6f6;
+  border: 3px solid #ef4444;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.22);
+}
+
+.message-text .risk-meter__legend {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 10px;
+  font-weight: 640;
+  font-size: 0.9rem;
+}
+
+.message-text .risk-meter__legend span:nth-child(1) {
+  color: #34d399;
+  text-align: left;
+}
+
+.message-text .risk-meter__legend span:nth-child(2) {
+  color: #fbbf24;
+  text-align: center;
+}
+
+.message-text .risk-meter__legend span:nth-child(3) {
+  color: #f87171;
+  text-align: right;
+}
+
+.message-text .risk-gauge-card__signals {
+  margin: 0 0 0.7rem;
+  padding: 0 0 0 1.1rem;
+  color: var(--muted);
+}
+
+.message-text .risk-gauge-card__signals li {
+  margin-bottom: 0.22rem;
+}
+
+.message-text .risk-gauge-card__question {
+  margin: 0;
+  font-weight: 640;
+}
+
+.message-visualizations {
+  display: grid;
+  gap: 10px;
+  margin: 0.25rem 0 0.85rem;
+}
+
+.transaction-receipt-card {
+  margin: 0.35rem 0 0.85rem;
+  border-radius: 16px;
+  border: 1px solid rgba(139, 211, 95, 0.45);
+  background: linear-gradient(180deg, rgba(35, 56, 40, 0.36) 0%, rgba(26, 39, 31, 0.28) 100%);
+  padding: 14px;
+}
+
+.transaction-receipt-card__header {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(174, 183, 164, 0.25);
+}
+
+.transaction-receipt-card__icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: rgba(139, 211, 95, 0.22);
+  border: 1px solid rgba(139, 211, 95, 0.58);
+  color: #d1fae5;
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.transaction-receipt-card__headline h4 {
+  margin: 0;
+  font-size: 1.06rem;
+  line-height: 1.35;
+}
+
+.transaction-receipt-card__headline p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.transaction-receipt-card__grid {
+  margin: 12px 0 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.transaction-receipt-card__row {
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.transaction-receipt-card__row dt {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.transaction-receipt-card__row dd {
+  margin: 0;
+  font-family: "JetBrains Mono", "Consolas", monospace;
+  font-size: 0.95rem;
+  font-weight: 640;
+  word-break: break-word;
+}
+
+.category-actions {
+  margin: 0.32rem 0 0.92rem;
+  display: grid;
+  gap: 8px;
+}
+
+.category-actions__hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.category-actions__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.category-action-btn {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 7px 13px;
+  white-space: nowrap;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 620;
+}
+
+.category-action-btn.primary {
+  border-color: rgba(139, 211, 95, 0.6);
+  background: rgba(139, 211, 95, 0.2);
+  color: #def6cd;
+}
+
+.category-action-btn.skip {
+  border-color: rgba(255, 255, 255, 0.28);
+  color: var(--muted);
+}
+
+.category-action-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.finance-chart-card {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  padding: 12px;
+  background: linear-gradient(180deg, rgba(11, 15, 14, 0.72) 0%, rgba(10, 16, 18, 0.46) 100%);
+}
+
+.finance-chart-card__header {
+  margin-bottom: 8px;
+}
+
+.finance-chart-card__title {
+  margin: 0;
+  font-size: 0.96rem;
+  font-weight: 740;
+}
+
+.finance-chart-card__subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.finance-chart-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.finance-chart-grid line {
+  stroke: rgba(255, 255, 255, 0.12);
+  stroke-width: 1;
+}
+
+.finance-chart-axis-label {
+  fill: var(--muted);
+  font-size: 10.5px;
+}
+
+.finance-chart-axis-label--angled {
+  font-size: 9.5px;
+}
+
+.finance-chart-line {
+  fill: none;
+  stroke-width: 2.4;
+}
+
+.finance-chart-point {
+  stroke: #0f130f;
+  stroke-width: 1.4;
+}
+
+.finance-chart-bar {
+  opacity: 0.96;
+}
+
+.finance-chart-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.finance-chart-legend {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.finance-chart-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.finance-chart-legend__swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
 }
 
 .message-text ul,
@@ -466,5 +814,42 @@ button {
 
   .workspace {
     min-height: auto;
+  }
+
+  .message-text .risk-gauge-card__header,
+  .message-text .risk-gauge-card__score-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .message-text .risk-gauge-card__chip {
+    font-size: 0.74rem;
+  }
+
+  .finance-chart-card {
+    padding: 10px;
+  }
+
+  .transaction-receipt-card {
+    padding: 12px;
+  }
+
+  .transaction-receipt-card__grid {
+    grid-template-columns: 1fr;
+    gap: 9px;
+  }
+
+  .category-actions__hint {
+    font-size: 0.79rem;
+  }
+
+  .category-action-btn {
+    padding: 7px 11px;
+    font-size: 0.79rem;
+  }
+
+  .finance-chart-card__title {
+    font-size: 0.9rem;
   }
 }

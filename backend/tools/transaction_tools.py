@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 import psycopg2
+import psycopg2.extras
 from langchain_core.tools import tool
 
 from backend.config import DATABASE_URL, CURRENT_BANK_CODE, TEXT2SQL_AGENT_URL
@@ -42,12 +43,32 @@ async def text2sql_query(question: str, user_id: str = "") -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # Some text2sql deployments treat execute=true as preview-only.
+            # Using /query/execute with only the question keeps execution enabled.
             resp = await client.post(
                 f"{TEXT2SQL_AGENT_URL}/query/execute",
-                json={"question": question, "execute": True},
+                json={"question": question},
             )
             resp.raise_for_status()
             data = resp.json()
+
+            # Defensive retry for inconsistent deployments.
+            if (
+                data.get("status") == "success"
+                and data.get("executed") is False
+                and data.get("results") is None
+            ):
+                logger.warning(
+                    "[text2sql_query] executed=false from /query/execute, retrying with execute=false"
+                )
+                retry_resp = await client.post(
+                    f"{TEXT2SQL_AGENT_URL}/query/execute",
+                    json={"question": question, "execute": False},
+                )
+                retry_resp.raise_for_status()
+                retry_data = retry_resp.json()
+                if retry_data.get("status") == "success":
+                    data = retry_data
     except httpx.HTTPStatusError as e:
         return {"status": "failed", "message": f"HTTP {e.response.status_code}"}
     except httpx.RequestError as e:
@@ -55,12 +76,41 @@ async def text2sql_query(question: str, user_id: str = "") -> dict:
 
     status = data.get("status")
     if status == "success":
+        sql = (data.get("sql") or "").strip()
+        executed = bool(data.get("executed"))
+
+        # Last-resort fallback: run generated SELECT directly when text2sql
+        # returns SQL but skips execution.
+        if (not executed or data.get("results") is None) and sql:
+            sql_no_trailing_semicolon = sql.rstrip(";").strip()
+            if sql_no_trailing_semicolon.lower().startswith("select"):
+                try:
+                    conn = psycopg2.connect(DATABASE_URL)
+                    try:
+                        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                            cur.execute(sql_no_trailing_semicolon)
+                            fallback_rows = [dict(r) for r in cur.fetchall()]
+                    finally:
+                        conn.close()
+
+                    data["results"] = fallback_rows
+                    data["row_count"] = len(fallback_rows)
+                    data["executed"] = True
+                    executed = True
+                    logger.warning(
+                        "[text2sql_query] fallback executed generated SQL locally, rows=%s",
+                        len(fallback_rows),
+                    )
+                except Exception as e:
+                    logger.warning(f"[text2sql_query] local execution fallback failed: {e}")
+
         rows = data.get("results") or []
         return {
             "status": "success",
             "rows": rows,
             "row_count": data.get("row_count", len(rows)),
             "sql": data.get("sql", ""),
+            "executed": executed,
         }
     elif status == "needs_clarification":
         return {
