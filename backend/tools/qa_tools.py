@@ -11,6 +11,9 @@ from backend.config import LIGHTRAG_SERVICE_URL
 
 logger = logging.getLogger(__name__)
 
+LIGHTRAG_CHUNK_TOP_K = 10
+LIGHTRAG_KG_TOP_K = 25
+
 
 @tool
 async def query_lightrag(
@@ -37,6 +40,8 @@ async def query_lightrag(
     payload = {
         "query": question.strip(),
         "mode": mode,
+        "chunk_top_k": LIGHTRAG_CHUNK_TOP_K,
+        "kg_top_k": LIGHTRAG_KG_TOP_K,
         "include_references": include_references,
         "include_chunk_content": False,
         "stream": False,
@@ -75,6 +80,8 @@ async def query_lightrag(
         "answer": answer,
         "references": references,
         "mode": mode,
+        "chunk_top_k": LIGHTRAG_CHUNK_TOP_K,
+        "kg_top_k": LIGHTRAG_KG_TOP_K,
     }
 
 

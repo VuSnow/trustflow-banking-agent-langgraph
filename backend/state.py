@@ -39,6 +39,7 @@ class ChatState(TypedDict):
     response_data: dict[str, Any]
     output_message: str
     output_data: dict[str, Any]
+    recent_history: list[dict[str, Any]]
 
 
 # ─── Card operation state ─────────────────────────────────────────────────────
