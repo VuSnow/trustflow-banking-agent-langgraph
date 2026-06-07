@@ -8,7 +8,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.prebuilt import create_react_agent
 
-from backend.config import OPENAI_API_KEY, OPENAI_MODEL
+from backend.config import DATABASE_URL, OPENAI_API_KEY, OPENAI_MODEL
 from backend.tools.fraud_tools import save_fraud_report_incident
 from backend.tools.transaction_tools import check_fraud_risk, text2sql_query
 from backend.prompts.fraud_report import FRAUD_REPORT_SYSTEM_PROMPT
@@ -103,9 +103,12 @@ def _parse_fraud_output(raw: str) -> dict:
                 "data": data,
             }
         elif status == "info_response":
+            message = data.get("message", "")
+            if data.get("operation") == "CHECK_ACCOUNT_RISK":
+                message = _ensure_account_risk_table(message, data)
             return {
                 "status": "info_response",
-                "message": data.get("message", ""),
+                "message": message,
                 "data": data.get("data", data),
             }
         elif status == "needs_clarification":
@@ -158,6 +161,110 @@ def _ensure_clarification_table(message: str, data: dict) -> str:
         "|---|---|---|\n"
         f"{rows}"
     )
+
+
+def _ensure_account_risk_table(message: str, data: dict) -> str:
+    """Ensure account-risk answers always include a user-facing Markdown table."""
+    if "|" in (message or ""):
+        return message
+
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    if not isinstance(payload, dict):
+        return message
+
+    payload = _enrich_account_risk_payload(payload)
+    account_no = _display_value(payload.get("account_no"))
+    bank_code = _display_value(payload.get("bank_code"), fallback="Không xác định")
+    is_reported = bool(payload.get("is_reported"))
+    risk_level = _display_value(payload.get("risk_level"), fallback="LOW")
+    report_count = _display_value(payload.get("report_count"), fallback="0")
+    unique_reporter_count = _display_value(payload.get("unique_reporter_count"), fallback="0")
+    total_reported_amount = _format_vnd(payload.get("total_reported_amount"))
+
+    if is_reported:
+        status_text = "Đã có báo cáo liên quan đến lừa đảo"
+    else:
+        status_text = "Chưa tìm thấy báo cáo lừa đảo trong dữ liệu hiện tại"
+
+    table = (
+        "| Thông tin | Kết quả |\n"
+        "|---|---|\n"
+        f"| Số tài khoản | {account_no} |\n"
+        f"| Ngân hàng | {bank_code} |\n"
+        f"| Tình trạng | {status_text} |\n"
+        f"| Mức rủi ro | {risk_level} |\n"
+        f"| Số báo cáo đã ghi nhận | {report_count} |\n"
+        f"| Số người báo cáo khác nhau | {unique_reporter_count} |\n"
+        f"| Tổng số tiền đã được báo cáo | {total_reported_amount} |"
+    )
+
+    return f"{message}\n\n{table}" if message else table
+
+
+def _enrich_account_risk_payload(payload: dict) -> dict:
+    """Fill missing account-risk fields from reported_accounts when the LLM omits them."""
+    account_no = str(payload.get("account_no") or "").strip()
+    if not account_no:
+        return payload
+
+    missing_details = (
+        not payload.get("bank_code")
+        or payload.get("report_count") is None
+        or payload.get("unique_reporter_count") is None
+        or payload.get("total_reported_amount") is None
+    )
+    if not missing_details:
+        return payload
+
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bank_code, risk_level, valid_report_count,
+                           unique_reporter_count, total_reported_amount, status
+                    FROM reported_accounts
+                    WHERE account_no = %s
+                    ORDER BY valid_report_count DESC, last_reported_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (account_no,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("[FRAUD AGENT] risk table enrichment failed: %s", exc)
+        return payload
+
+    if not row:
+        return payload
+
+    enriched = dict(payload)
+    enriched.setdefault("bank_code", row[0])
+    enriched.setdefault("risk_level", row[1])
+    enriched.setdefault("report_count", row[2])
+    enriched.setdefault("unique_reporter_count", row[3])
+    enriched.setdefault("total_reported_amount", row[4])
+    enriched.setdefault("account_status", row[5])
+    enriched["is_reported"] = True
+    return enriched
+
+
+def _display_value(value: object, fallback: str = "Không có") -> str:
+    text = str(value or "").strip()
+    return text or fallback
+
+
+def _format_vnd(value: object) -> str:
+    try:
+        amount = int(str(value or "0").replace(",", "").strip())
+    except ValueError:
+        amount = 0
+    return f"{amount:,} VND".replace(",", ".")
 
 
 def _looks_like_incident_intake(message: str) -> bool:
