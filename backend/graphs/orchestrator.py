@@ -85,13 +85,17 @@ async def _classify_intent(message: str, history_messages: list[Any] | None = No
     if history_messages:
         lines: list[str] = []
         for msg in history_messages[-6:]:
-            content = getattr(msg, "content", "")
+            content = msg.get("message", "") if isinstance(msg, dict) else getattr(msg, "content", "")
             if not content:
                 continue
-            msg_type = getattr(msg, "type", "")
+            msg_type = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "type", "")
             if msg_type == "human":
                 role = "user"
+            elif msg_type == "user":
+                role = "user"
             elif msg_type == "ai":
+                role = "assistant"
+            elif msg_type == "assistant":
                 role = "assistant"
             else:
                 role = "system"
@@ -346,7 +350,12 @@ async def dispatch_agent_node(state: ChatState) -> dict:
             flow = None  # clear the category flow
             _category_was_cleared = True
 
-        intent = await _classify_intent(last_message, messages[:-1])
+        persisted_history = state.get("recent_history") or []
+        history_for_intent = persisted_history[:-1] if persisted_history else messages[:-1]
+        if _is_fraud_report_continuation(last_message, persisted_history):
+            intent = "FRAUD_REPORT"
+        else:
+            intent = await _classify_intent(last_message, history_for_intent)
 
         if intent is None:
             # QA — answer directly without starting flow
@@ -370,7 +379,11 @@ async def dispatch_agent_node(state: ChatState) -> dict:
         if intent == "FRAUD_REPORT":
             from backend.agents.fraud_report import run_fraud_agent
 
-            fraud_history = _serialize_message_history(messages[:-1])
+            fraud_history = (
+                _serialize_persisted_message_history(persisted_history[:-1])
+                if persisted_history
+                else _serialize_message_history(messages[:-1])
+            )
             fraud_result = await run_fraud_agent(
                 message=last_message,
                 user_id=state["user_id"],
@@ -1877,6 +1890,82 @@ def _intent_display_name(intent: str) -> str:
         "FINANCE_ADVICE": "tư vấn tài chính",
     }
     return names.get(intent, intent.lower())
+
+
+def _is_fraud_report_continuation(message: str, persisted_history: list[dict]) -> bool:
+    """Keep short answers in the fraud-report flow after a fraud intake prompt."""
+    if not persisted_history or _looks_like_explicit_new_non_fraud_intent(message):
+        return False
+
+    previous_messages = persisted_history[:-1]
+    for item in reversed(previous_messages[-4:]):
+        if item.get("role") != "assistant":
+            continue
+        content = str(item.get("message") or "").lower()
+        data = _parse_history_data(item.get("data"))
+        if _history_data_task_type(data) == "FRAUD_REPORT":
+            return True
+        if "báo cáo lừa đảo" in content and (
+            "thông tin cần cung cấp" in content
+            or "vui lòng cung cấp" in content
+            or "số tài khoản bị báo cáo" in content
+        ):
+            return True
+        return False
+    return False
+
+
+def _looks_like_explicit_new_non_fraud_intent(message: str) -> bool:
+    normalized = (message or "").lower()
+    fraud_terms = ("lừa đảo", "fraud", "scam", "bị lừa", "báo cáo")
+    if any(term in normalized for term in fraud_terms):
+        return False
+    new_intent_terms = (
+        "chuyển tiền",
+        "chuyển khoản",
+        "thanh toán",
+        "nạp tiền",
+        "mở thẻ",
+        "khóa thẻ",
+        "mở tài khoản",
+        "số dư",
+        "lịch sử giao dịch",
+    )
+    return any(term in normalized for term in new_intent_terms)
+
+
+def _history_data_task_type(data: Any) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    direct = data.get("task_type")
+    if isinstance(direct, str):
+        return direct
+    nested = data.get("data")
+    if isinstance(nested, dict):
+        task_type = nested.get("task_type")
+        if isinstance(task_type, str):
+            return task_type
+    return None
+
+
+def _parse_history_data(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value
+
+
+def _serialize_persisted_message_history(messages: list[dict]) -> list[dict]:
+    """Convert DB message rows into the fraud agent history shape."""
+    history: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("message", "")
+        if role in {"user", "assistant"} and content:
+            history.append({"role": role, "message": content})
+    return history
 
 
 def _serialize_message_history(messages: list[BaseMessage]) -> list[dict]:

@@ -226,6 +226,17 @@ def _save_fraud_report_incident(payload: dict[str, Any]) -> dict:
         "report_id": report_id,
         "account_risk_level": risk_level,
         "account_warning": warning,
+        "account_risk_details": {
+            "account_no": reported_account_no,
+            "bank_code": reported_bank_code,
+            "risk_level": risk_level,
+            "report_count": int(aggregate["valid_report_count"] or 0),
+            "previous_report_count": existing_report_count,
+            "had_previous_reports": existing_report_count > 0,
+            "unique_reporter_count": int(aggregate["unique_reporter_count"] or 0),
+            "total_reported_amount": total_reported_amount,
+            "status": "ACTIVE",
+        },
     }
 
 
