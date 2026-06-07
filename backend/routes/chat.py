@@ -71,6 +71,7 @@ async def chat_endpoint(request: ChatRequest):
         role="user",
         message=request.message,
     )
+    recent_history = chat_session_store.get_messages(request.session_id, limit=12)
 
     # Restore active_flow from checkpoint
     checkpointer = await get_checkpointer()
@@ -91,6 +92,7 @@ async def chat_endpoint(request: ChatRequest):
         "route_decision": None,
         "response_message": "",
         "response_data": {},
+        "recent_history": recent_history,
     }
 
     # Run the graph
