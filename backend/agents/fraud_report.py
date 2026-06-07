@@ -9,13 +9,14 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.prebuilt import create_react_agent
 
 from backend.config import OPENAI_API_KEY, OPENAI_MODEL
+from backend.tools.fraud_tools import save_fraud_report_incident
 from backend.tools.transaction_tools import check_fraud_risk, text2sql_query
 from backend.prompts.fraud_report import FRAUD_REPORT_SYSTEM_PROMPT
 from backend.services.langfuse_trace import get_trace_config
 
 logger = logging.getLogger(__name__)
 
-FRAUD_TOOLS = [check_fraud_risk, text2sql_query]
+FRAUD_TOOLS = [check_fraud_risk, text2sql_query, save_fraud_report_incident]
 
 
 def create_fraud_agent():
