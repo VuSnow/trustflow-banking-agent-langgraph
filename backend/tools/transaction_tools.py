@@ -170,7 +170,8 @@ def check_fraud_risk(account_no: str, bank_code: str = "") -> dict:
     """Check if a recipient account has been reported for fraud.
 
     Queries reported_accounts table for risk assessment.
-    Call AFTER verify_recipient succeeds.
+    This can be called directly for user risk-check questions, or after
+    recipient verification in the transfer flow.
 
     Args:
         account_no: The recipient account number to screen.
