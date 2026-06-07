@@ -35,6 +35,420 @@ function renderMarkdown(value) {
   return DOMPurify.sanitize(html);
 }
 
+const CHART_COLORS = ["#10b981", "#38bdf8", "#f59e0b", "#ef4444", "#14b8a6", "#f97316"];
+
+function parseMessageData(value) {
+  if (!value) return null;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value === "object") return value;
+  return null;
+}
+
+function extractVisualizationPayload(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+  if (Array.isArray(parsed.visualizations)) return parsed;
+  if (parsed.data && typeof parsed.data === "object" && Array.isArray(parsed.data.visualizations)) {
+    return parsed.data;
+  }
+  return null;
+}
+
+function toNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function compactAxisLabel(value, maxLength = 12) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "N/A";
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(1, maxLength - 1))}…`;
+}
+
+function wrapAxisLabel(value, maxCharsPerLine = 10, maxLines = 4) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return ["N/A"];
+
+  const safeMaxChars = Math.max(4, maxCharsPerLine);
+  const safeMaxLines = Math.max(1, maxLines);
+
+  // Split long words first so wrapping still works without spaces.
+  const words = normalized
+    .split(" ")
+    .flatMap((word) => {
+      if (word.length <= safeMaxChars) return [word];
+      const chunks = [];
+      for (let i = 0; i < word.length; i += safeMaxChars) {
+        chunks.push(word.slice(i, i + safeMaxChars));
+      }
+      return chunks;
+    })
+    .filter(Boolean);
+
+  const lines = [];
+  let current = "";
+
+  for (let idx = 0; idx < words.length; idx += 1) {
+    const word = words[idx];
+    const candidate = current ? `${current} ${word}` : word;
+    if (!current || candidate.length <= safeMaxChars) {
+      current = candidate;
+      continue;
+    }
+
+    lines.push(current);
+    current = word;
+
+    if (lines.length >= safeMaxLines - 1) {
+      const rest = [current, ...words.slice(idx + 1)].join(" ").trim();
+      if (rest) lines.push(rest);
+      return lines.slice(0, safeMaxLines);
+    }
+  }
+
+  if (current) lines.push(current);
+  return lines.slice(0, safeMaxLines);
+}
+
+function formatMetric(value, currency = "VND", unit = null) {
+  const n = toNumber(value);
+  if (unit === "percent") return `${n.toFixed(2)}%`;
+  if (unit === "count") return `${Math.round(n)}`;
+  if (currency === "VND") {
+    return `${new Intl.NumberFormat("vi-VN").format(Math.round(n))} đ`;
+  }
+  return new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 2 }).format(n);
+}
+
+function estimateYAxisPadding(tickValues, currency, unit, minPadding = 56, maxPadding = 132) {
+  const longest = tickValues.reduce((maxLength, value) => {
+    const size = formatMetric(value, currency, unit).length;
+    return Math.max(maxLength, size);
+  }, 0);
+
+  const estimated = Math.ceil(longest * 6.1 + 18);
+  return Math.max(minPadding, Math.min(maxPadding, estimated));
+}
+
+function normalizeChart(chart) {
+  if (!chart || typeof chart !== "object") return null;
+  const labels = Array.isArray(chart.labels) ? chart.labels.map((item) => String(item)) : [];
+  const series = Array.isArray(chart.series)
+    ? chart.series
+        .map((item) => ({
+          name: String(item?.name || "Series"),
+          values: Array.isArray(item?.values) ? item.values.map(toNumber) : [],
+        }))
+        .filter((item) => item.values.length > 0)
+    : [];
+
+  if (!labels.length || !series.length) return null;
+  return {
+    id: String(chart.id || ""),
+    type: String(chart.type || "bar"),
+    title: String(chart.title || "Biểu đồ"),
+    subtitle: chart.subtitle ? String(chart.subtitle) : "",
+    unit: chart.unit ? String(chart.unit) : null,
+    currency: chart.currency ? String(chart.currency) : "VND",
+    labels,
+    series,
+  };
+}
+
+function ChartLegend({ series }) {
+  return e(
+    "ul",
+    { class: "finance-chart-legend" },
+    series.map((item, index) =>
+      e(
+        "li",
+        { key: `${item.name}-${index}` },
+        e("span", {
+          class: "finance-chart-legend__swatch",
+          style: `background:${CHART_COLORS[index % CHART_COLORS.length]}`,
+        }),
+        e("span", null, item.name),
+      ),
+    ),
+  );
+}
+
+function LineChart({ labels, series, currency, unit }) {
+  const width = 640;
+  const height = 236;
+  const maxValue = Math.max(1, ...series.flatMap((item) => item.values.map(toNumber)));
+  const yTicks = 4;
+  const tickValues = Array.from({ length: yTicks + 1 }, (_, index) => (maxValue / yTicks) * (yTicks - index));
+  const padding = {
+    top: 16,
+    right: 16,
+    bottom: 34,
+    left: estimateYAxisPadding(tickValues, currency, unit, 64, 136),
+  };
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+
+  function x(index) {
+    if (labels.length <= 1) return padding.left + chartWidth / 2;
+    return padding.left + (index * chartWidth) / (labels.length - 1);
+  }
+
+  function y(value) {
+    return padding.top + chartHeight - (toNumber(value) / maxValue) * chartHeight;
+  }
+
+  const paths = series.map((item, seriesIndex) => {
+    const d = item.values
+      .map((value, valueIndex) => `${valueIndex === 0 ? "M" : "L"} ${x(valueIndex)} ${y(value)}`)
+      .join(" ");
+    return e("path", {
+      key: `${item.name}-line`,
+      d,
+      class: "finance-chart-line",
+      style: `stroke:${CHART_COLORS[seriesIndex % CHART_COLORS.length]}`,
+    });
+  });
+
+  return e(
+    "svg",
+    { class: "finance-chart-svg", viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": "line chart" },
+    e(
+      "g",
+      { class: "finance-chart-grid" },
+      tickValues.map((value, index) => {
+        const yPos = padding.top + (chartHeight * index) / yTicks;
+        return e(
+          "g",
+          { key: `y-${index}` },
+          e("line", {
+            x1: padding.left,
+            y1: yPos,
+            x2: width - padding.right,
+            y2: yPos,
+          }),
+          e(
+            "text",
+            {
+              class: "finance-chart-axis-label",
+              x: padding.left - 8,
+              y: yPos + 4,
+              "text-anchor": "end",
+            },
+            formatMetric(value, currency, unit),
+          ),
+        );
+      }),
+    ),
+    paths,
+    series.map((item, seriesIndex) =>
+      item.values.map((value, valueIndex) =>
+        e("circle", {
+          key: `${item.name}-point-${valueIndex}`,
+          class: "finance-chart-point",
+          cx: x(valueIndex),
+          cy: y(value),
+          r: 3.5,
+          style: `fill:${CHART_COLORS[seriesIndex % CHART_COLORS.length]}`,
+        }),
+      ),
+    ),
+    e(
+      "g",
+      { class: "finance-chart-axis" },
+      labels.map((label, index) => {
+        const isFirst = index === 0;
+        const isLast = index === labels.length - 1;
+        const anchor = isFirst ? "start" : isLast ? "end" : "middle";
+        const xPos = x(index) + (isFirst ? 2 : isLast ? -2 : 0);
+        return e(
+          "text",
+          {
+            key: `${label}-${index}`,
+            class: "finance-chart-axis-label",
+            x: xPos,
+            y: height - 12,
+            "text-anchor": anchor,
+          },
+          label,
+        );
+      }),
+    ),
+  );
+}
+
+function BarChart({ labels, series, currency, unit, grouped = false }) {
+  const width = 640;
+  const height = 262;
+  const maxValue = Math.max(1, ...series.flatMap((item) => item.values.map(toNumber)));
+  const yTicks = 4;
+  const tickValues = Array.from({ length: yTicks + 1 }, (_, index) => (maxValue / yTicks) * (yTicks - index));
+  const leftPadding = estimateYAxisPadding(tickValues, currency, unit, 64, 136);
+  const chartWidth = width - leftPadding - 16;
+  const groupCount = labels.length;
+  const groupWidth = groupCount ? chartWidth / groupCount : chartWidth;
+  const labelMaxLength = Math.max(5, Math.min(13, Math.floor(groupWidth / 6.1)));
+  const wrappedLabels = labels.map((label) => wrapAxisLabel(label, labelMaxLength, 4));
+  const maxLabelLines = wrappedLabels.reduce((maxLines, lines) => Math.max(maxLines, lines.length), 1);
+  const labelLineHeight = 11;
+  const labelBlockHeight = maxLabelLines * labelLineHeight;
+  const padding = {
+    top: 16,
+    right: 16,
+    bottom: Math.max(44, labelBlockHeight + 24),
+    left: leftPadding,
+  };
+  const chartHeight = height - padding.top - padding.bottom;
+
+  function y(value) {
+    return padding.top + chartHeight - (toNumber(value) / maxValue) * chartHeight;
+  }
+
+  const seriesCount = grouped ? series.length : 1;
+  const barArea = groupWidth * 0.74;
+  const barWidth = Math.max(8, Math.min(34, barArea / Math.max(seriesCount, 1)));
+  const labelY = padding.top + chartHeight + 14;
+
+  const bars = labels.flatMap((_, labelIndex) => {
+    const items = grouped ? series : [series[0]];
+    return items.map((item, seriesIndex) => {
+      const value = toNumber(item.values[labelIndex]);
+      const baseX = padding.left + labelIndex * groupWidth + (groupWidth - barArea) / 2;
+      const x = baseX + seriesIndex * barWidth;
+      const yPos = y(value);
+      return e("rect", {
+        key: `${item.name}-${labelIndex}-${seriesIndex}`,
+        class: "finance-chart-bar",
+        x,
+        y: yPos,
+        width: Math.max(2, barWidth - 1.5),
+        height: Math.max(1, padding.top + chartHeight - yPos),
+        rx: 3,
+        ry: 3,
+        style: `fill:${CHART_COLORS[seriesIndex % CHART_COLORS.length]}`,
+      });
+    });
+  });
+
+  return e(
+    "svg",
+    { class: "finance-chart-svg", viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": "bar chart" },
+    e(
+      "g",
+      { class: "finance-chart-grid" },
+      tickValues.map((value, index) => {
+        const yPos = padding.top + (chartHeight * index) / yTicks;
+        return e(
+          "g",
+          { key: `bar-y-${index}` },
+          e("line", {
+            x1: padding.left,
+            y1: yPos,
+            x2: width - padding.right,
+            y2: yPos,
+          }),
+          e(
+            "text",
+            {
+              class: "finance-chart-axis-label",
+              x: padding.left - 8,
+              y: yPos + 4,
+                "text-anchor": "end",
+            },
+            formatMetric(value, currency, unit),
+          ),
+        );
+      }),
+    ),
+    bars,
+    e(
+      "g",
+      { class: "finance-chart-axis" },
+      labels.map((label, index) => {
+        const xPos = padding.left + index * groupWidth + groupWidth / 2;
+        const lines = wrappedLabels[index] || [String(label || "")];
+
+        return e(
+          "text",
+          {
+            key: `${label}-${index}`,
+            class: "finance-chart-axis-label finance-chart-axis-label--multiline",
+            x: xPos,
+            y: labelY,
+            "text-anchor": "middle",
+          },
+          lines.map((line, lineIndex) =>
+            e(
+              "tspan",
+              {
+                key: `${label}-${index}-line-${lineIndex}`,
+                x: xPos,
+                dy: lineIndex === 0 ? 0 : labelLineHeight,
+              },
+              line,
+            ),
+          ),
+        );
+      }),
+    ),
+  );
+}
+
+function FinanceChart({ chart, fallbackCurrency }) {
+  const currency = chart.currency || fallbackCurrency || "VND";
+  if (chart.type === "line") {
+    return e(LineChart, { labels: chart.labels, series: chart.series, currency, unit: chart.unit });
+  }
+  if (chart.type === "bar-grouped") {
+    return e(BarChart, {
+      labels: chart.labels,
+      series: chart.series,
+      currency,
+      unit: chart.unit,
+      grouped: true,
+    });
+  }
+  if (chart.type === "bar") {
+    return e(BarChart, {
+      labels: chart.labels,
+      series: chart.series,
+      currency,
+      unit: chart.unit,
+      grouped: false,
+    });
+  }
+  return e("p", { class: "finance-chart-empty" }, "Biểu đồ chưa được hỗ trợ.");
+}
+
+function FinanceVisualizations({ visualizations, currency = "VND" }) {
+  const charts = (visualizations || []).map(normalizeChart).filter(Boolean);
+  if (!charts.length) return null;
+
+  return e(
+    "section",
+    { class: "message-visualizations" },
+    charts.map((chart, index) =>
+      e(
+        "article",
+        { key: chart.id || `${chart.type}-${index}`, class: "finance-chart-card" },
+        e(
+          "div",
+          { class: "finance-chart-card__header" },
+          e("h4", { class: "finance-chart-card__title" }, chart.title),
+          chart.subtitle ? e("p", { class: "finance-chart-card__subtitle" }, chart.subtitle) : null,
+        ),
+        e(FinanceChart, { chart, fallbackCurrency: currency }),
+        chart.series.length > 1 ? e(ChartLegend, { series: chart.series }) : null,
+      ),
+    ),
+  );
+}
+
 function IconButton({ title, onClick, children, kind = "ghost", disabled = false }) {
   return e(
     "button",
@@ -187,7 +601,10 @@ function Topbar({ session, title, setTitle, onRename, onDelete, loading = false,
 
 function MessageBubble({ message }) {
   const isUser = message.role === "user";
-  const payload = message.data ? JSON.stringify(message.data, null, 2) : null;
+  const parsedData = parseMessageData(message.data);
+  const vizPayload = extractVisualizationPayload(parsedData);
+  const visualizations = Array.isArray(vizPayload?.visualizations) ? vizPayload.visualizations : [];
+  const payload = parsedData ? JSON.stringify(parsedData, null, 2) : message.data ? String(message.data) : null;
   return e(
     "article",
     { class: `message ${isUser ? "user" : "assistant"} ${message.pending ? "pending" : ""}` },
@@ -204,6 +621,9 @@ function MessageBubble({ message }) {
           class: "message-text",
           dangerouslySetInnerHTML: { __html: renderMarkdown(message.message) },
         }),
+    !isUser && !message.pending && visualizations.length
+      ? e(FinanceVisualizations, { visualizations, currency: vizPayload?.currency || "VND" })
+      : null,
     payload ? e("details", null, e("summary", null, "Response data"), e("pre", null, payload)) : null,
   );
 }

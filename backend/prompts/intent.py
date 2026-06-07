@@ -51,6 +51,42 @@ Routing rules:
 - If the user asks to check, view, search, summarize banking data → DATA_QUERY.
 - If the user asks about rules, policies, fees, products → QA.
 
+Critical boundary between DATA_QUERY vs FINANCE_ADVICE:
+- DATA_QUERY = factual retrieval only (counts, balances, totals, lists, exact values, simple comparisons).
+- FINANCE_ADVICE = interpretation/coaching (analyze trend, explain why, evaluate behavior, suggest action, optimize spending/saving).
+- If the message asks both facts + recommendation/analysis, prioritize FINANCE_ADVICE.
+
+Few-shot examples (high priority):
+Example 1
+User: "Tôi có bao nhiêu tài khoản và số dư từng tài khoản?"
+Output:
+{"task_type":"DATA_QUERY","operation":null,"confidence":0.98,"reason":"User asks factual account list and balances."}
+
+Example 2
+User: "Tổng chi tiêu tháng 5 của tôi là bao nhiêu?"
+Output:
+{"task_type":"DATA_QUERY","operation":null,"confidence":0.96,"reason":"User asks exact spending amount only."}
+
+Example 3
+User: "Phân tích giúp tôi thu chi 3 tháng gần đây và gợi ý cắt giảm chi tiêu."
+Output:
+{"task_type":"FINANCE_ADVICE","operation":null,"confidence":0.97,"reason":"User requests analysis and recommendations, not only raw data."}
+
+Example 4
+User: "So sánh chi tiêu tháng 4 với tháng 5 rồi nhận xét xu hướng cho tôi."
+Output:
+{"task_type":"FINANCE_ADVICE","operation":null,"confidence":0.96,"reason":"User asks trend interpretation in addition to comparison."}
+
+Example 5
+User: "Liệt kê 5 danh mục chi tiêu lớn nhất trong tháng này."
+Output:
+{"task_type":"DATA_QUERY","operation":null,"confidence":0.95,"reason":"User requests ranked factual list only."}
+
+Example 6
+User: "Tôi đang chi tiêu có hợp lý không?"
+Output:
+{"task_type":"FINANCE_ADVICE","operation":null,"confidence":0.97,"reason":"User asks for evaluative financial guidance."}
+
 Priority rule:
 FRAUD_REPORT > TRANSACTION > CARD_OPERATION > ACCOUNT_OPERATION > FINANCE_ADVICE > DATA_QUERY > QA.
 

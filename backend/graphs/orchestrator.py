@@ -501,7 +501,7 @@ async def dispatch_agent_node(state: ChatState) -> dict:
                 },
             }
 
-        elif intent in ("FINANCE_ADVICE", "DATA_QUERY"):
+        elif intent == "FINANCE_ADVICE":
             from backend.agents.finance_advisor import run_finance_agent
 
             # Build history from messages for context
@@ -519,9 +519,49 @@ async def dispatch_agent_node(state: ChatState) -> dict:
                 session_id=state["session_id"],
                 history=history or None,
             )
+
+            finance_data = finance_result.get("data") if isinstance(finance_result, dict) else None
+            if not isinstance(finance_data, dict):
+                finance_data = {}
+            finance_data.setdefault("handled", True)
+            finance_data.setdefault("task_type", "FINANCE_ADVICE")
+
             result = {
                 "response_message": finance_result["message"],
-                "response_data": {"handled": True, "task_type": "FINANCE_ADVICE"},
+                "response_data": finance_data,
+            }
+            if _category_was_cleared:
+                result["active_flow"] = None
+            return result
+
+        elif intent == "DATA_QUERY":
+            from backend.agents.data_query import run_data_query_agent
+
+            # Build history from messages for context
+            history = []
+            for msg in messages[:-1]:  # exclude current message
+                if hasattr(msg, "type"):
+                    if msg.type == "human":
+                        history.append({"role": "user", "message": msg.content})
+                    elif msg.type == "ai" and msg.content:
+                        history.append({"role": "assistant", "message": msg.content})
+
+            query_result = await run_data_query_agent(
+                message=last_message,
+                user_id=state["user_id"],
+                session_id=state["session_id"],
+                history=history or None,
+            )
+
+            query_data = query_result.get("data") if isinstance(query_result, dict) else None
+            if not isinstance(query_data, dict):
+                query_data = {}
+            query_data.setdefault("handled", True)
+            query_data.setdefault("task_type", "DATA_QUERY")
+
+            result = {
+                "response_message": query_result.get("message", "Không thể truy vấn dữ liệu lúc này."),
+                "response_data": query_data,
             }
             if _category_was_cleared:
                 result["active_flow"] = None
@@ -530,7 +570,7 @@ async def dispatch_agent_node(state: ChatState) -> dict:
         else:
             # Non-supported intent
             result = {
-                "response_message": "Hiện tôi chỉ hỗ trợ chuyển tiền, thanh toán hóa đơn, nạp tiền, quản lý thẻ, và tư vấn tài chính.",
+                "response_message": "Hiện tôi hỗ trợ chuyển tiền, thanh toán hóa đơn, nạp tiền, quản lý thẻ, tra cứu thông tin, và tư vấn tài chính.",
                 "response_data": {"handled": True},
             }
             if _category_was_cleared:

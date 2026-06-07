@@ -244,7 +244,7 @@ button {
 }
 
 .message {
-  max-width: min(860px, 100%);
+  max-width: 100%;
   padding: 14px 16px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -254,11 +254,13 @@ button {
 
 .message.user {
   align-self: flex-end;
+  max-width: min(860px, 100%);
   background: var(--user);
 }
 
 .message.assistant {
   align-self: flex-start;
+  width: min(100%, 1040px);
   background: var(--assistant);
 }
 
@@ -466,6 +468,99 @@ button {
   font-weight: 640;
 }
 
+.message-visualizations {
+  display: grid;
+  gap: 10px;
+  margin: 0.25rem 0 0.85rem;
+}
+
+.finance-chart-card {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  padding: 12px;
+  background: linear-gradient(180deg, rgba(11, 15, 14, 0.72) 0%, rgba(10, 16, 18, 0.46) 100%);
+}
+
+.finance-chart-card__header {
+  margin-bottom: 8px;
+}
+
+.finance-chart-card__title {
+  margin: 0;
+  font-size: 0.96rem;
+  font-weight: 740;
+}
+
+.finance-chart-card__subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.finance-chart-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.finance-chart-grid line {
+  stroke: rgba(255, 255, 255, 0.12);
+  stroke-width: 1;
+}
+
+.finance-chart-axis-label {
+  fill: var(--muted);
+  font-size: 10.5px;
+}
+
+.finance-chart-axis-label--angled {
+  font-size: 9.5px;
+}
+
+.finance-chart-line {
+  fill: none;
+  stroke-width: 2.4;
+}
+
+.finance-chart-point {
+  stroke: #0f130f;
+  stroke-width: 1.4;
+}
+
+.finance-chart-bar {
+  opacity: 0.96;
+}
+
+.finance-chart-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.finance-chart-legend {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.finance-chart-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.finance-chart-legend__swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
 .message-text ul,
 .message-text ol {
   padding-left: 1.4rem;
@@ -615,5 +710,13 @@ button {
 
   .message-text .risk-gauge-card__chip {
     font-size: 0.74rem;
+  }
+
+  .finance-chart-card {
+    padding: 10px;
+  }
+
+  .finance-chart-card__title {
+    font-size: 0.9rem;
   }
 }
