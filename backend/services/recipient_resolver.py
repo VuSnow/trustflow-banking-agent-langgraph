@@ -13,6 +13,7 @@ Methods:
 from __future__ import annotations
 
 import logging
+import unicodedata
 from dataclasses import dataclass, field
 
 import psycopg2
@@ -51,6 +52,14 @@ def _mask_account(account_no: str) -> str:
     return "****" + account_no[-4:]
 
 
+def _normalize_search_text(value: str) -> str:
+    """Normalize Vietnamese text for accent-insensitive matching."""
+    text = (value or "").strip().casefold().replace("đ", "d")
+    decomposed = unicodedata.normalize("NFD", text)
+    no_marks = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+    return " ".join(no_marks.split())
+
+
 class RecipientResolver:
     """Deterministic SQL recipient resolution — no LLM in this path."""
 
@@ -67,6 +76,10 @@ class RecipientResolver:
         if not name_query or not user_id:
             return []
 
+        normalized_query = _normalize_search_text(name_query)
+        if not normalized_query:
+            return []
+
         try:
             conn = psycopg2.connect(DATABASE_URL)
             try:
@@ -77,24 +90,32 @@ class RecipientResolver:
                                beneficiary_bank_code, beneficiary_bank_name
                         FROM beneficiaries
                         WHERE cif_no = %s
-                          AND unaccent(lower(beneficiary_name)) LIKE unaccent(lower(%s))
                         ORDER BY last_used_at DESC NULLS LAST
-                        LIMIT %s
                         """,
-                        (user_id, f"%{name_query}%", max_results),
+                        (user_id,),
                     )
                     rows = cur.fetchall()
-                    return [
-                        RecipientCandidate(
-                            beneficiary_id=row["beneficiary_id"],
-                            name=row["beneficiary_name"],
-                            account_no=str(row["beneficiary_account_no"]),
-                            account_no_masked=_mask_account(str(row["beneficiary_account_no"])),
-                            bank_code=row["beneficiary_bank_code"],
-                            bank_name=row["beneficiary_bank_name"] or row["beneficiary_bank_code"],
+
+                    candidates: list[RecipientCandidate] = []
+                    for row in rows:
+                        beneficiary_name = row["beneficiary_name"] or ""
+                        if normalized_query not in _normalize_search_text(beneficiary_name):
+                            continue
+
+                        candidates.append(
+                            RecipientCandidate(
+                                beneficiary_id=row["beneficiary_id"],
+                                name=beneficiary_name,
+                                account_no=str(row["beneficiary_account_no"]),
+                                account_no_masked=_mask_account(str(row["beneficiary_account_no"])),
+                                bank_code=row["beneficiary_bank_code"],
+                                bank_name=row["beneficiary_bank_name"] or row["beneficiary_bank_code"],
+                            )
                         )
-                        for row in rows
-                    ]
+                        if len(candidates) >= max_results:
+                            break
+
+                    return candidates
             finally:
                 conn.close()
         except Exception as e:
