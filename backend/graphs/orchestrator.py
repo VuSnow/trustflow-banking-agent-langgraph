@@ -73,7 +73,7 @@ _flow_router = FlowRouter()
 # ─── Intent Classifier ────────────────────────────────────────────────────────
 
 
-async def _classify_intent(message: str) -> str | None:
+async def _classify_intent(message: str, history_messages: list[Any] | None = None) -> str | None:
     """Classify message into intent type using LLM.
 
     Returns composite key like 'TRANSACTION:TRANSFER_MONEY' or just task_type.
@@ -81,10 +81,28 @@ async def _classify_intent(message: str) -> str | None:
     """
     llm = ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY, temperature=0.0)
 
+    history_text = "(none)"
+    if history_messages:
+        lines: list[str] = []
+        for msg in history_messages[-6:]:
+            content = getattr(msg, "content", "")
+            if not content:
+                continue
+            msg_type = getattr(msg, "type", "")
+            if msg_type == "human":
+                role = "user"
+            elif msg_type == "ai":
+                role = "assistant"
+            else:
+                role = "system"
+            lines.append(f"{role}: {content}")
+        if lines:
+            history_text = "\n".join(lines)
+
     try:
         response = await llm.ainvoke([
             SystemMessage(content=INTENT_SYSTEM_PROMPT),
-            HumanMessage(content=INTENT_USER_TEMPLATE.format(message=message)),
+            HumanMessage(content=INTENT_USER_TEMPLATE.format(message=message, history=history_text)),
         ])
         data = json.loads(response.content)
         task_type = data.get("task_type", "UNKNOWN")
@@ -132,17 +150,9 @@ TEMPLATES = {
         "Giao dịch: chuyển {amount} đến {recipient_name}."
     ),
     "success_receipt": (
-        "Giao dịch thành công.\n\n"
+        "Hệ thống ghi nhận yêu cầu. Tài khoản đã thực hiện giao dịch thành công!\n\n"
         "Mã giao dịch: {ref}\n"
-        "Thời gian: {time}\n"
-        "Từ tài khoản: {source}\n"
-        "Người nhận: {recipient_name}\n"
-        "Ngân hàng: {bank}\n"
-        "Số tài khoản nhận: {masked_account}\n\n"
-        "Số tiền chuyển: {amount}\n"
-        "Phí giao dịch: {fee}\n"
-        "Tổng tiền đã trừ: {total_debit}\n"
-        "Số dư còn lại: {balance}"
+        "Thời gian: {time}"
     ),
     "otp_wrong": "Mã OTP không đúng. Còn {remaining} lần thử. Vui lòng nhập lại.",
     "otp_expired": "Mã OTP đã hết hạn. Vui lòng thực hiện lại giao dịch.",
@@ -242,10 +252,8 @@ TEMPLATES = {
     "topup_amount_invalid": "Số tiền nạp phải từ 10,000 đến {max_amount} VND.",
     # ─── Category Templates ───
     "category_confirm": (
-        "📂 Giao dịch này thuộc loại: **{predicted_name}**\n"
-        "Đúng không? Hoặc chọn:\n"
-        "{alternatives_list}\n"
-        "(Gõ \"bỏ qua\" nếu không muốn phân loại)"
+        "📂 Dự đoán loại giao dịch: **{predicted_name}**.\n"
+        "Nếu muốn đổi, chọn các nút bên dưới (hoặc gõ số tương ứng)."
     ),
     "category_confirmed": "✅ Đã phân loại: **{category_name}**",
     "category_saved_default": "📂 Đã lưu phân loại: **{category_name}**",
@@ -338,7 +346,7 @@ async def dispatch_agent_node(state: ChatState) -> dict:
             flow = None  # clear the category flow
             _category_was_cleared = True
 
-        intent = await _classify_intent(last_message)
+        intent = await _classify_intent(last_message, messages[:-1])
 
         if intent is None:
             # QA — answer directly without starting flow
@@ -562,6 +570,39 @@ async def dispatch_agent_node(state: ChatState) -> dict:
             result = {
                 "response_message": query_result.get("message", "Không thể truy vấn dữ liệu lúc này."),
                 "response_data": query_data,
+            }
+            if _category_was_cleared:
+                result["active_flow"] = None
+            return result
+
+        elif intent == "FINANCE_PLANNING":
+            from backend.agents.finance_planning import run_finance_planning_agent
+
+            # Build history from messages for context
+            history = []
+            for msg in messages[:-1]:  # exclude current message
+                if hasattr(msg, "type"):
+                    if msg.type == "human":
+                        history.append({"role": "user", "message": msg.content})
+                    elif msg.type == "ai" and msg.content:
+                        history.append({"role": "assistant", "message": msg.content})
+
+            planning_result = await run_finance_planning_agent(
+                message=last_message,
+                user_id=state["user_id"],
+                session_id=state["session_id"],
+                history=history or None,
+            )
+
+            planning_data = planning_result.get("data") if isinstance(planning_result, dict) else None
+            if not isinstance(planning_data, dict):
+                planning_data = {}
+            planning_data.setdefault("handled", True)
+            planning_data.setdefault("task_type", "FINANCE_PLANNING")
+
+            result = {
+                "response_message": planning_result.get("message", "Không thể lập kế hoạch tài chính lúc này."),
+                "response_data": planning_data,
             }
             if _category_was_cleared:
                 result["active_flow"] = None
@@ -1148,21 +1189,41 @@ async def handle_flow_action_node(state: ChatState) -> dict:
                     )
                     flow.updated_at = datetime.now()
 
-                    # Format category question
-                    alternatives_list = "\n".join(
-                        f"  {i+1}. {alt['name']}"
-                        for i, alt in enumerate(category_result["alternatives"])
-                    )
                     category_msg = TEMPLATES["category_confirm"].format(
                         predicted_name=category_result["predicted_name"],
-                        alternatives_list=alternatives_list,
                     )
+
+                    response_data = exec_result.get("data") if isinstance(exec_result, dict) else None
+                    if not isinstance(response_data, dict):
+                        response_data = {}
+
+                    alternatives = category_result.get("alternatives") or []
+                    response_data["category_confirmation"] = {
+                        "predicted_name": category_result.get("predicted_name"),
+                        "predicted_code": category_result.get("predicted_code"),
+                        "confidence": float(category_result.get("confidence") or 0.0),
+                        "alternatives": [
+                            {
+                                "index": i + 1,
+                                "name": alt.get("name"),
+                                "code": alt.get("code"),
+                                "category_id": alt.get("category_id"),
+                                "command": str(i + 1),
+                            }
+                            for i, alt in enumerate(alternatives)
+                            if isinstance(alt, dict)
+                        ],
+                        "commands": {
+                            "confirm": "đúng",
+                            "skip": "bỏ qua",
+                        },
+                    }
 
                     message += f"\n\n{category_msg}"
                     return {
                         "active_flow": serialize_flow(flow),
                         "response_message": message,
-                        "response_data": exec_result.get("data", {}),
+                        "response_data": response_data,
                     }
 
             return {
@@ -1706,19 +1767,45 @@ async def _execute_transaction(flow: FlowState, user_id: str, session_id: str) -
     )
 
     if result.success:
+        amount_value = int(draft.amount or 0)
+        fee_value = int(result.fee or draft.fee or 0)
+        total_debit_value = amount_value + fee_value
+        balance_after_value = result.balance_after if result.balance_after is not None else 0
+
+        balance_before_raw = result.data.get("balance_before") if isinstance(result.data, dict) else None
+        if balance_before_raw is None and result.balance_after is not None:
+            balance_before_raw = int(result.balance_after) + total_debit_value
+        balance_before_value = int(balance_before_raw or 0)
+
+        recipient_bank = draft.recipient_bank_name or draft.recipient_bank_code or "?"
+        recipient_account_no = draft.recipient_account_no or "?"
+
         message = TEMPLATES["success_receipt"].format(
             ref=result.transaction_ref or "N/A",
             time=datetime.now().strftime("%d/%m/%Y %H:%M"),
-            source=draft.source_account_no_masked or "?",
-            recipient_name=draft.recipient_name or "?",
-            bank=draft.recipient_bank_name or draft.recipient_bank_code or "?",
-            masked_account=draft.recipient_account_no_masked or "?",
-            amount=f"{draft.amount:,.0f} VND" if draft.amount else "?",
-            fee=f"{draft.fee:,.0f} VND" if draft.fee is not None else "0 VND",
-            total_debit=f"{draft.total_debit:,.0f} VND" if draft.total_debit else "?",
-            balance=f"{result.balance_after:,.0f} VND" if result.balance_after else "?",
         )
-        return {"message": message, "data": {"executed": True, "ref": result.transaction_ref}}
+        return {
+            "message": message,
+            "data": {
+                "executed": True,
+                "ref": result.transaction_ref,
+                "receipt": {
+                    "type": "TRANSFER_SUCCESS",
+                    "transaction_ref": result.transaction_ref,
+                    "transaction_time": datetime.now().isoformat(timespec="seconds"),
+                    "amount": amount_value,
+                    "recipient_name": draft.recipient_name or "?",
+                    "recipient_account_no": recipient_account_no,
+                    "recipient_account_no_masked": draft.recipient_account_no_masked or _mask_account(recipient_account_no),
+                    "recipient_bank": recipient_bank,
+                    "service_fee": fee_value,
+                    "total_debit": total_debit_value,
+                    "balance_before": balance_before_value,
+                    "balance_after": balance_after_value,
+                    "source_account_no_masked": draft.source_account_no_masked or "?",
+                },
+            },
+        }
     else:
         return {
             "message": f"Giao dịch thất bại: {result.message}",
@@ -1764,6 +1851,7 @@ def _intent_display_name(intent: str) -> str:
         "CARD_OPERATION": "quản lý thẻ",
         "ACCOUNT_OPERATION": "quản lý tài khoản",
         "DATA_QUERY": "tra cứu thông tin",
+        "FINANCE_PLANNING": "lập kế hoạch tài chính",
         "QA": "hỏi đáp",
         "FINANCE_ADVICE": "tư vấn tài chính",
     }

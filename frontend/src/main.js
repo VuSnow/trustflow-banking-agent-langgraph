@@ -59,6 +59,63 @@ function extractVisualizationPayload(parsed) {
   return null;
 }
 
+function extractTransferReceipt(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const direct = parsed.receipt;
+  const nested = parsed.data && typeof parsed.data === "object" ? parsed.data.receipt : null;
+  const receipt = (nested && typeof nested === "object" ? nested : direct) || null;
+
+  if (!receipt || receipt.type !== "TRANSFER_SUCCESS") return null;
+
+  return {
+    transaction_ref: String(receipt.transaction_ref || "N/A"),
+    transaction_time: receipt.transaction_time ? String(receipt.transaction_time) : "",
+    amount: toNumber(receipt.amount),
+    recipient_name: String(receipt.recipient_name || "?"),
+    recipient_account_no: String(receipt.recipient_account_no || receipt.recipient_account_no_masked || "?"),
+    recipient_bank: String(receipt.recipient_bank || "?"),
+    service_fee: toNumber(receipt.service_fee),
+    total_debit: toNumber(receipt.total_debit),
+    balance_before: toNumber(receipt.balance_before),
+    balance_after: toNumber(receipt.balance_after),
+  };
+}
+
+function extractCategoryConfirmation(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const flowStatus = String(parsed.flow_status || "");
+  if (flowStatus && flowStatus !== "WAITING_CATEGORY_CONFIRMATION") return null;
+
+  const direct = parsed.category_confirmation;
+  const nested = parsed.data && typeof parsed.data === "object" ? parsed.data.category_confirmation : null;
+  const category = (nested && typeof nested === "object" ? nested : direct) || null;
+
+  if (!category) return null;
+
+  const alternativesRaw = Array.isArray(category.alternatives) ? category.alternatives : [];
+  const alternatives = alternativesRaw
+    .map((item, index) => {
+      if (!item || typeof item !== "object") return null;
+      return {
+        index: Number.isFinite(Number(item.index)) ? Number(item.index) : index + 1,
+        name: String(item.name || `Lựa chọn ${index + 1}`),
+        command: String(item.command || index + 1),
+      };
+    })
+    .filter(Boolean);
+
+  const commands = category.commands && typeof category.commands === "object" ? category.commands : {};
+
+  return {
+    predicted_name: String(category.predicted_name || "Khác"),
+    alternatives,
+    confirm_command: String(commands.confirm || "đúng"),
+    skip_command: String(commands.skip || "bỏ qua"),
+  };
+}
+
 function toNumber(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
@@ -124,6 +181,25 @@ function formatMetric(value, currency = "VND", unit = null) {
     return `${new Intl.NumberFormat("vi-VN").format(Math.round(n))} đ`;
   }
   return new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 2 }).format(n);
+}
+
+function formatVnd(value) {
+  const amount = toNumber(value);
+  return `${new Intl.NumberFormat("vi-VN").format(Math.round(amount))} VND`;
+}
+
+function formatReceiptTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("vi-VN", {
+    hour12: false,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function estimateYAxisPadding(tickValues, currency, unit, minPadding = 56, maxPadding = 132) {
@@ -449,6 +525,109 @@ function FinanceVisualizations({ visualizations, currency = "VND" }) {
   );
 }
 
+function TransactionReceiptCard({ receipt }) {
+  const rows = [
+    { label: "Số tiền", value: formatVnd(receipt.amount) },
+    { label: "Người nhận", value: receipt.recipient_name },
+    { label: "Số tài khoản", value: receipt.recipient_account_no },
+    { label: "Ngân hàng", value: receipt.recipient_bank },
+    { label: "Phí dịch vụ", value: formatVnd(receipt.service_fee) },
+    { label: "Tổng tiền bị trừ", value: formatVnd(receipt.total_debit) },
+    { label: "Số dư trước giao dịch", value: formatVnd(receipt.balance_before) },
+    { label: "Số dư sau giao dịch", value: formatVnd(receipt.balance_after) },
+  ];
+
+  const formattedTime = formatReceiptTime(receipt.transaction_time);
+
+  return e(
+    "section",
+    { class: "transaction-receipt-card" },
+    e(
+      "div",
+      { class: "transaction-receipt-card__header" },
+      e("div", { class: "transaction-receipt-card__icon" }, e(Check, { size: 16 })),
+      e(
+        "div",
+        { class: "transaction-receipt-card__headline" },
+        e(
+          "h4",
+          null,
+          "Hệ thống ghi nhận yêu cầu. Tài khoản đã thực hiện giao dịch thành công!",
+        ),
+        e(
+          "p",
+          null,
+          `Mã giao dịch: ${receipt.transaction_ref}`,
+          formattedTime ? ` · ${formattedTime}` : "",
+        ),
+      ),
+    ),
+    e(
+      "dl",
+      { class: "transaction-receipt-card__grid" },
+      rows.map((item) =>
+        e(
+          "div",
+          { key: item.label, class: "transaction-receipt-card__row" },
+          e("dt", null, item.label),
+          e("dd", null, item.value),
+        ),
+      ),
+    ),
+  );
+}
+
+function CategoryChoiceButtons({ categoryConfirmation, onQuickReply, disabled = false }) {
+  if (!categoryConfirmation || typeof onQuickReply !== "function") return null;
+
+  return e(
+    "section",
+    { class: "category-actions" },
+    e(
+      "p",
+      { class: "category-actions__hint" },
+      "Chọn loại giao dịch (nếu bạn không chọn và gửi yêu cầu mới, hệ thống sẽ lưu giá trị dự đoán mặc định).",
+    ),
+    e(
+      "div",
+      { class: "category-actions__row" },
+      e(
+        "button",
+        {
+          type: "button",
+          class: "category-action-btn primary",
+          onClick: () => onQuickReply(categoryConfirmation.confirm_command),
+          disabled,
+        },
+        `Giữ: ${categoryConfirmation.predicted_name}`,
+      ),
+      categoryConfirmation.alternatives.map((item) =>
+        e(
+          "button",
+          {
+            key: `${item.index}-${item.name}`,
+            type: "button",
+            class: "category-action-btn",
+            onClick: () => onQuickReply(item.command),
+            disabled,
+          },
+          `${item.index}. ${item.name}`,
+        ),
+      ),
+      e(
+        "button",
+        {
+          type: "button",
+          class: "category-action-btn skip",
+          onClick: () => onQuickReply(categoryConfirmation.skip_command),
+          disabled,
+        },
+        "Bỏ qua",
+      ),
+    ),
+  );
+}
+
 function IconButton({ title, onClick, children, kind = "ghost", disabled = false }) {
   return e(
     "button",
@@ -599,10 +778,12 @@ function Topbar({ session, title, setTitle, onRename, onDelete, loading = false,
   );
 }
 
-function MessageBubble({ message }) {
+function MessageBubble({ message, isLatest = false, onQuickReply, quickReplyDisabled = false }) {
   const isUser = message.role === "user";
   const parsedData = parseMessageData(message.data);
   const vizPayload = extractVisualizationPayload(parsedData);
+  const transferReceipt = extractTransferReceipt(parsedData);
+  const categoryConfirmation = extractCategoryConfirmation(parsedData);
   const visualizations = Array.isArray(vizPayload?.visualizations) ? vizPayload.visualizations : [];
   const payload = parsedData ? JSON.stringify(parsedData, null, 2) : message.data ? String(message.data) : null;
   return e(
@@ -621,6 +802,14 @@ function MessageBubble({ message }) {
           class: "message-text",
           dangerouslySetInnerHTML: { __html: renderMarkdown(message.message) },
         }),
+    !isUser && !message.pending && transferReceipt ? e(TransactionReceiptCard, { receipt: transferReceipt }) : null,
+    !isUser && !message.pending && isLatest && categoryConfirmation
+      ? e(CategoryChoiceButtons, {
+          categoryConfirmation,
+          onQuickReply,
+          disabled: quickReplyDisabled,
+        })
+      : null,
     !isUser && !message.pending && visualizations.length
       ? e(FinanceVisualizations, { visualizations, currency: vizPayload?.currency || "VND" })
       : null,
@@ -628,7 +817,7 @@ function MessageBubble({ message }) {
   );
 }
 
-function MessageList({ messages, activeSessionId, loading = false }) {
+function MessageList({ messages, activeSessionId, loading = false, onQuickReply, quickReplyDisabled = false }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
@@ -649,7 +838,15 @@ function MessageList({ messages, activeSessionId, loading = false }) {
           )
       : messages.length === 0
         ? e("div", { class: "empty-state" }, e(Bot, { size: 34 }), e("h3", null, "Start the conversation"))
-        : messages.map((message) => e(MessageBubble, { key: message.id || `${message.role}-${message.created_at}`, message })),
+        : messages.map((message, index) =>
+            e(MessageBubble, {
+              key: message.id || `${message.role}-${message.created_at}`,
+              message,
+              isLatest: index === messages.length - 1,
+              onQuickReply,
+              quickReplyDisabled,
+            }),
+          ),
   );
 }
 
@@ -983,7 +1180,13 @@ function App() {
         saving: busyAction === "save" || busyAction === "delete",
       }),
       error ? e("div", { class: "error-banner" }, error) : null,
-      e(MessageList, { messages, activeSessionId, loading: isSessionLoading }),
+      e(MessageList, {
+        messages,
+        activeSessionId,
+        loading: isSessionLoading,
+        onQuickReply: handleSend,
+        quickReplyDisabled: !canSend || busyAction === "send",
+      }),
       e(Composer, { disabled: !canSend || busyAction === "send", onSend: handleSend, loading: busyAction === "send" }),
     ),
   );
